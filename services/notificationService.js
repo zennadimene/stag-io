@@ -390,7 +390,7 @@ const notifyInternshipCompleted = async (completionData) => {
                     <h3>${internshipTitle}</h3>
                     ${certificateUrl ? `
                         <p>Your certificate is now available:</p>
-                        <a href="http://localhost:5000${certificateUrl}" 
+                        <a href="http://stag-io-backend.onrender.com${certificateUrl}" 
                            style="background: #6b46c1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
                             📜 Download Certificate
                         </a>

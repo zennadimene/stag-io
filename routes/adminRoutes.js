@@ -33,7 +33,7 @@ const sendAgreementEmail = async (agreementData) => {
       }
     });
 
-    const pdfLink = `http://localhost:5000${pdf_url}`;
+    const pdfLink = `http://stag-io-backend.onrender.com${pdf_url}`;
 
     const mailOptions = {
       from: `"STAG Platform" <${process.env.EMAIL_USER}>`,
@@ -1159,7 +1159,7 @@ router.post('/api/admin/agreements/:id/send', protect, isAdmin, async (req, res)
       }
     });
 
-    const pdfLink = `http://localhost:5000${agreement.pdf_url}`;
+    const pdfLink = `http://stag-io-backend.onrender.com${agreement.pdf_url}`;
 
     const mailOptions = {
       from: `"STAG Platform" <${process.env.EMAIL_USER || 'your-email@gmail.com'}>`,

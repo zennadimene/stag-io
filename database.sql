@@ -343,4 +343,4 @@ CREATE TABLE IF NOT EXISTS documents (
 
 INSERT INTO users (id, email, password, user_type, is_verified, created_at, updated_at) 
 VALUES (1, 'admin@stag.com', '$2a$10$RB1x4.ggJx6VpJkDsDFhSedjtDRqIOohQKE1QnEdvV1e2.XM1GxzC', 'admin', 1, NOW(), NOW());
-SHOW TABLES;
+SHOW TABLES;$2a$10$3qgZAksydHTNZcAlingVBugKt0dIOS1tYcA/DWDvrWPO1DY2BXT2G
