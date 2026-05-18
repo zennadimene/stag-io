@@ -1,0 +1,4391 @@
+  // server.js - WITH REAL DATABASE INTEGRATION
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const multer = require('multer'); 
+const fs = require('fs');
+require('dotenv').config();
+const studentRoutes = require('./routes/studentRoutes');
+
+
+// Import database connection
+const db = require('./config/database');
+
+// Import authentication middleware
+const { protect } = require('./middleware/authMiddleware');
+
+const app = express();
+
+// ============================================
+// MIDDLEWARE
+// ============================================
+app.use(cors());
+app.use(express.json());
+
+// 📌 COMPANY APPLICATIONS ROUTES
+const companyApplicationsRoutes = require('./routes/companyApplications');
+app.use('/', companyApplicationsRoutes);
+
+// Admin Notifications Routes
+const adminNotificationsRoutes = require('./routes/adminNotifications');
+app.use('/', adminNotificationsRoutes);
+
+// Admin Routes
+const adminRoutes = require('./routes/adminRoutes');
+app.use('/', adminRoutes);
+
+
+// ✅ STATIC FILES - SERVING UPLOADS
+const path = require('path');
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/api/student', studentRoutes);
+
+const AUTO_VERIFY = true; 
+
+// Configure multer for file uploads
+const storage = multer.memoryStorage();
+const upload = multer({ 
+    storage: storage,
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB
+    },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PDF files are allowed'), false);
+        }
+    }
+});
+
+
+
+// 📌 ROUTE 1: Home
+app.get('/', (req, res) => {
+    res.json({ 
+        message: '🎉 STAG Platform Backend is running!',
+        version: '3.0.0',
+        database: 'MySQL Active',
+        endpoints: {
+            home: 'GET /',
+            health: 'GET /health',
+            register_student: 'POST /api/auth/register/student',
+            register_company: 'POST /api/auth/register/company',
+            login: 'POST /api/auth/login',
+            test_db: 'GET /api/test-db',
+            get_profile: 'GET /api/auth/me', 
+            update_profile: 'PUT /api/student/profile'
+        }
+    });
+});
+
+// 📌 ROUTE 2: Health check
+app.get('/health', async (req, res) => {
+    try {
+        // Test database connection
+        const [dbResult] = await db.execute('SELECT 1 + 1 AS result');
+        
+        res.json({ 
+            status: '✅ healthy',
+            timestamp: new Date().toISOString(),
+            database: 'Connected ✓',
+            uptime: process.uptime()
+        });
+    } catch (error) {
+        res.json({ 
+            status: '⚠️ partial',
+            timestamp: new Date().toISOString(),
+            database: 'Not connected ✗',
+            error: error.message
+        });
+    }
+});
+
+// 📌 ROUTE 3: Test database connection
+app.get('/api/test-db', async (req, res) => {
+    try {
+        // Get counts from all tables
+        const [usersCount] = await db.execute('SELECT COUNT(*) as count FROM users');
+        const [studentsCount] = await db.execute('SELECT COUNT(*) as count FROM students');
+        const [companiesCount] = await db.execute('SELECT COUNT(*) as count FROM companies');
+        
+        res.json({
+            success: true,
+            message: 'Database connection successful',
+            counts: {
+                users: usersCount[0].count,
+                students: studentsCount[0].count,
+                companies: companiesCount[0].count
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Database error',
+            error: error.message
+        });
+    }
+});
+
+// 📌 ROUTE 4: Student Registration (REAL DATABASE)
+app.post('/api/auth/register/student', async (req, res) => {
+    console.log('\n🎓 Student Registration Request:', {
+        email: req.body.university_email,
+        time: new Date().toLocaleTimeString()
+    });
+    
+    // Start database transaction
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const {
+            first_name,
+            last_name,
+            university_email,
+            phone,
+            birth_date,
+            university,
+            specialization,
+            year_of_study,
+            student_id,
+            skills,
+            github_link,
+            linkedin_link,
+            password,
+            training_type,
+            preferred_wilaya,
+            expected_start_date
+        } = req.body;
+
+        // Validate required data
+        if (!university_email || !password || !first_name || !last_name || !university || !specialization || !year_of_study) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Please enter all required fields: email, password, name, university, specialization, year'
+            });
+        }
+
+        // Check for duplicate email
+        const [existingUsers] = await connection.execute(
+            'SELECT id FROM users WHERE email = ?',
+            [university_email]
+        );
+        
+        if (existingUsers.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Email already registered'
+            });
+        }
+
+        // 🔐 Hash password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        // Generate verification token
+        const verificationToken = crypto.randomBytes(32).toString('hex');
+
+        // 1️⃣ Insert into USERS table
+        const [userResult] = await connection.execute(
+            `INSERT INTO users 
+            (email, password, user_type, verification_token, created_at) 
+            VALUES (?, ?, ?, ?, NOW())`,
+            [university_email, hashedPassword, 'student', verificationToken]
+        );
+        
+        const userId = userResult.insertId;
+        console.log('✅ User created with ID:', userId);
+
+        // 2️⃣ Insert into STUDENTS table
+        await connection.execute(
+            `INSERT INTO students 
+            (user_id, first_name, last_name, university_email, phone, 
+             birth_date, university, specialization, year_of_study,
+             student_id, skills, github_link, linkedin_link,
+             training_type, preferred_wilaya, expected_start_date,
+             created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [
+                userId,
+                first_name,
+                last_name,
+                university_email,
+                phone || null,
+                birth_date || null,
+                university,
+                specialization,
+                year_of_study,
+                student_id || null,
+                skills ? JSON.stringify(skills) : null,
+                github_link || null,
+                linkedin_link || null,
+                training_type || null,
+                preferred_wilaya || null,
+                expected_start_date || null
+            ]
+        );
+        
+        console.log('✅ Student profile created for user ID:', userId);
+
+        // Commit transaction
+        await connection.commit();
+        connection.release();
+
+        // Return success response
+        res.status(201).json({
+            success: true,
+            message: 'Student registered successfully! Please check your email for verification.',
+            user: {
+                id: userId,
+                email: university_email,
+                user_type: 'student',
+                is_verified: false
+            },
+            student: {
+                first_name,
+                last_name,
+                university,
+                specialization,
+                year_of_study
+            }
+        });
+
+    } catch (error) {
+        // Rollback transaction on error
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Student registration error:', error);
+        
+        // Check for specific MySQL errors
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({
+                success: false,
+                message: 'Email or student ID already exists'
+            });
+        }
+        
+        res.status(500).json({
+            success: false,
+            message: 'Registration error',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+// 📌 ROUTE 5: Company Registration (REAL DATABASE)
+app.post('/api/auth/register/company', async (req, res) => {
+    console.log('\n🏢 Company Registration Request:', {
+        email: req.body.company_email,
+        time: new Date().toLocaleTimeString()
+    });
+    
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const {
+            company_name,
+            company_email,
+            phone,
+            website,
+            trade_register,
+            activity_sector,
+            company_size,
+            wilaya,
+            address,
+            contact_person,
+            position,
+            personal_email,
+            description,
+            password
+        } = req.body;
+
+        // Validate required data
+        if (!company_email || !password || !company_name || !contact_person || !trade_register) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Please enter all required fields: email, password, company name, contact person, trade register'
+            });
+        }
+
+        // Check for duplicate email
+        const [existingUsers] = await connection.execute(
+            'SELECT id FROM users WHERE email = ?',
+            [company_email]
+        );
+        
+        if (existingUsers.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Company email already registered'
+            });
+        }
+
+        // Check for duplicate trade register
+        const [existingCompanies] = await connection.execute(
+            'SELECT id FROM companies WHERE trade_register = ?',
+            [trade_register]
+        );
+        
+        if (existingCompanies.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Trade register number already exists'
+            });
+        }
+
+        // 🔐 Hash password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        // Generate verification token
+        const verificationToken = crypto.randomBytes(32).toString('hex');
+
+        // 1️⃣ Insert into USERS table
+        const [userResult] = await connection.execute(
+            `INSERT INTO users 
+            (email, password, user_type, verification_token, created_at) 
+            VALUES (?, ?, ?, ?, NOW())`,
+            [company_email, hashedPassword, 'company', verificationToken]
+        );
+        
+        const userId = userResult.insertId;
+        console.log('✅ Company user created with ID:', userId);
+
+        // 2️⃣ Insert into COMPANIES table
+        await connection.execute(
+            `INSERT INTO companies 
+            (user_id, company_name, company_email, phone, website,
+             trade_register, activity_sector, company_size, wilaya,
+             address, contact_person, position, personal_email, description,
+             created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [
+                userId,
+                company_name,
+                company_email,
+                phone || null,
+                website || null,
+                trade_register,
+                activity_sector || null,
+                company_size || null,
+                wilaya || null,
+                address || null,
+                contact_person,
+                position || null,
+                personal_email || null,
+                description || null
+            ]
+        );
+        
+        console.log('✅ Company profile created for user ID:', userId);
+
+        // Commit transaction
+        await connection.commit();
+        connection.release();
+
+        // Return success response
+        res.status(201).json({
+            success: true,
+            message: 'Company registered successfully! Please check your email for verification.',
+            user: {
+                id: userId,
+                email: company_email,
+                user_type: 'company',
+                is_verified: false
+            },
+            company: {
+                company_name,
+                contact_person,
+                trade_register,
+                activity_sector,
+                wilaya
+            }
+        });
+
+    } catch (error) {
+        // Rollback transaction on error
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Company registration error:', error);
+        
+        res.status(500).json({
+            success: false,
+            message: 'Registration error',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+// 📌 ROUTE 6: Login (REAL DATABASE)
+app.post('/api/auth/login', async (req, res) => {
+    console.log('\n🔐 Login Request:', {
+        email: req.body.email,
+        time: new Date().toLocaleTimeString()
+    });
+    
+    try {
+        const { email, password } = req.body;
+
+        // Validate data
+        if (!email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please enter email and password'
+            });
+        }
+
+        // Find user in database
+        const [users] = await db.execute(
+            'SELECT id, email, password, user_type, is_verified FROM users WHERE email = ?',
+            [email]
+        );
+        
+        if (users.length === 0) {
+            console.log('❌ User not found:', email);
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid email or password'
+            });
+        }
+        
+        const user = users[0];
+
+        // Verify password with bcrypt
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        
+        if (!isPasswordValid) {
+            console.log('❌ Password mismatch for:', email);
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid email or password'
+            });
+        }
+
+        // Check if account is verified (admin is auto-verified)
+        if (!user.is_verified && user.user_type !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: 'Your account is pending verification. Please wait for approval.',
+                needs_verification: true
+            });
+        }
+
+        // Get profile data based on user type
+        let profile = null;
+        if (user.user_type === 'student') {
+            const [students] = await db.execute(
+                'SELECT * FROM students WHERE user_id = ?',
+                [user.id]
+            );
+            profile = students[0];
+        } else if (user.user_type === 'company') {
+            const [companies] = await db.execute(
+                'SELECT * FROM companies WHERE user_id = ?',
+                [user.id]
+            );
+            profile = companies[0];
+        } else if (user.user_type === 'admin') {
+            profile = { name: 'System Administrator' };
+        }
+
+        // Create JWT token
+        const token = jwt.sign(
+            {
+                id: user.id,
+                email: user.email,
+                user_type: user.user_type
+            },
+            process.env.JWT_SECRET || 'default_jwt_secret_12345',
+            { expiresIn: '7d' }
+        );
+
+        console.log('✅ Login successful:', {
+            email: user.email,
+            user_type: user.user_type,
+            id: user.id
+        });
+
+        // Dashboard routes
+        const dashboardRoutes = {
+            'student': '/student/dashboard',
+            'company': '/company/dashboard',
+            'admin': '/admin/dashboard'
+        };
+
+        // Send response
+        res.json({
+            success: true,
+            token: token,
+            user: {
+                id: user.id,
+                email: user.email,
+                user_type: user.user_type,
+                is_verified: user.is_verified
+            },
+            profile: profile,
+            redirectTo: dashboardRoutes[user.user_type]
+        });
+
+    } catch (error) {
+        console.error('🔥 Login error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+// 📌 ROUTE 7: Verify email
+app.get('/api/auth/verify-email/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        
+        const [result] = await db.execute(
+            'UPDATE users SET is_verified = TRUE, verification_token = NULL WHERE verification_token = ?',
+            [token]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid or expired verification token'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Email verified successfully! You can now login.'
+        });
+    } catch (error) {
+        console.error('Verification error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Verification error'
+        });
+    }
+});
+
+// 📌 ROUTE 8: Admin verify user
+app.post('/api/admin/verify-user/:userId', async (req, res) => {
+    try {
+        const userId = req.params.userId;
+        
+        const [result] = await db.execute(
+            'UPDATE users SET is_verified = TRUE WHERE id = ?',
+            [userId]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'User verified successfully'
+        });
+    } catch (error) {
+        console.error('Admin verification error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Verification error'
+        });
+    }
+});
+
+// 📌 ROUTE 9: Get current user profile (PROTECTED)
+app.get('/api/auth/me', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        
+        console.log('🔍 Fetching profile for:', { userId, userType });
+        
+        if (userType === 'student') {
+            // Get student profile - FIXED QUERY
+            const [students] = await db.execute(
+                `SELECT 
+                    first_name, 
+                    last_name, 
+                    university, 
+                    specialization, 
+                    year_of_study,
+                    wilaya,
+                    phone,
+                    bio,
+                    skills,
+                    github_link,
+                    linkedin_link,
+                    cv_url,
+                    profile_image_url, 
+                    created_at
+                FROM students 
+                WHERE user_id = ?`,
+                [userId]
+            );
+            
+            if (students.length === 0) {
+                // Return empty profile if not found
+                return res.json({
+                    success: true,
+                    profile: {
+                        first_name: '',
+                        last_name: '',
+                        university: '',
+                        specialization: '',
+                        year_of_study: '',
+                        wilaya: '',
+                        phone: '',
+                        bio: '',
+                        skills: [],
+                        github_url: '',
+                        portfolio_url: '',
+                        cv_url: '',
+                        profile_image_url: '',
+                        created_at: null
+                    }
+                });
+            }
+            
+            const student = students[0];
+            
+            // Parse skills
+            let skills = [];
+            if (student.skills) {
+                try {
+                    skills = JSON.parse(student.skills);
+                } catch (e) {
+                    if (typeof student.skills === 'string') {
+                        skills = student.skills.split(',').map(s => s.trim()).filter(s => s);
+                    }
+                }
+            }
+            
+            res.json({
+                success: true,
+                profile: {
+                    first_name: student.first_name || '',
+                    last_name: student.last_name || '',
+                    university: student.university || '',
+                    specialization: student.specialization || '',
+                    year_of_study: student.year_of_study || '',
+                    wilaya: student.wilaya || '',
+                    phone: student.phone || '',
+                    bio: student.bio || '',
+                    skills: skills,
+                    github_url: student.github_link || '',
+                    portfolio_url: student.linkedin_link || '',
+                    cv_url: student.cv_url || '',
+                    profile_image_url: student.profile_image_url || '',
+                    created_at: student.created_at
+                }
+            });
+            
+        } else if (userType === 'company') {
+            // Get company profile
+            const [companies] = await db.execute(
+                `SELECT * FROM companies WHERE user_id = ?`,
+                [userId]
+            );
+            
+            if (companies.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Company profile not found'
+                });
+            }
+            
+            res.json({
+                success: true,
+                profile: companies[0]
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                message: 'Invalid user type'
+            });
+        }
+        
+    } catch (error) {
+        console.error('🔥 Error fetching profile:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error loading profile'
+        });
+    }
+});
+
+// 📌 ROUTE 10: Update student profile (PROTECTED)
+/*app.put('/api/student/profile', protect, upload.single('cv'), async (req, res) => {
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const userId = req.user.id;
+        
+        // Verify this is a student
+        const [users] = await connection.execute(
+            'SELECT user_type FROM users WHERE id = ?',
+            [userId]
+        );
+        
+        if (users.length === 0 || users[0].user_type !== 'student') {
+            await connection.rollback();
+            connection.release();
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Student only.'
+            });
+        }
+        
+        // Parse form data
+        const {
+            first_name,
+            last_name,
+            university,
+            specialization,
+            year_of_study,
+            wilaya,
+            phone,
+            bio,
+            skills,
+            github_url,
+            portfolio_url
+        } = req.body;
+        
+        // Handle skills
+        let skillsArray = [];
+        if (skills) {
+            try {
+                skillsArray = JSON.parse(skills);
+            } catch (e) {
+                skillsArray = Array.isArray(skills) ? skills : [skills];
+            }
+        }
+        
+        // Handle CV file upload
+        let cvUrl = null;
+        if (req.file) {
+            const fileName = `cv_${userId}_${Date.now()}.pdf`;
+            cvUrl = `/uploads/${fileName}`;
+            // TODO: Save file to disk or cloud
+        }
+        
+        // Update student profile
+        const updateFields = [];
+        const updateValues = [];
+        
+        if (first_name) { updateFields.push('first_name = ?'); updateValues.push(first_name); }
+        if (last_name) { updateFields.push('last_name = ?'); updateValues.push(last_name); }
+        if (university) { updateFields.push('university = ?'); updateValues.push(university); }
+        if (specialization) { updateFields.push('specialization = ?'); updateValues.push(specialization); }
+        if (year_of_study) { updateFields.push('year_of_study = ?'); updateValues.push(year_of_study); }
+        if (wilaya) { updateFields.push('wilaya = ?'); updateValues.push(wilaya); }
+        if (phone) { updateFields.push('phone = ?'); updateValues.push(phone); }
+        if (bio) { updateFields.push('bio = ?'); updateValues.push(bio); }
+        if (skillsArray.length > 0) { 
+            updateFields.push('skills = ?'); 
+            updateValues.push(JSON.stringify(skillsArray)); 
+        }
+        if (github_url) { updateFields.push('github_link = ?'); updateValues.push(github_url); }
+        if (portfolio_url) { updateFields.push('linkedin_link = ?'); updateValues.push(portfolio_url); }
+        if (cvUrl) { updateFields.push('cv_url = ?'); updateValues.push(cvUrl); }
+        
+        updateFields.push('updated_at = NOW()');
+        
+        if (updateFields.length > 0) {
+            updateValues.push(userId);
+            
+            const [result] = await connection.execute(
+                `UPDATE students SET ${updateFields.join(', ')} WHERE user_id = ?`,
+                updateValues
+            );
+            
+            if (result.affectedRows === 0) {
+                // Create profile if doesn't exist
+                await connection.execute(
+                    `INSERT INTO students 
+                    (user_id, first_name, last_name, university, specialization, 
+                     year_of_study, wilaya, phone, bio, skills, github_link, 
+                     linkedin_link, cv_url, created_at, updated_at) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                    [
+                        userId,
+                        first_name || '',
+                        last_name || '',
+                        university || '',
+                        specialization || '',
+                        year_of_study || '',
+                        wilaya || '',
+                        phone || '',
+                        bio || '',
+                        JSON.stringify(skillsArray),
+                        github_url || '',
+                        portfolio_url || '',
+                        cvUrl || null
+                    ]
+                );
+            }
+        }
+        
+        // Commit transaction
+        await connection.commit();
+        connection.release();
+        
+        // Get updated profile
+        const [updatedStudent] = await db.execute(
+            'SELECT * FROM students WHERE user_id = ?',
+            [userId]
+        );
+        
+        res.json({
+            success: true,
+            message: 'Profile updated successfully',
+            profile: updatedStudent[0] || {}
+        });
+        
+    } catch (error) {
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Error updating profile:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error updating profile',
+            error: error.message
+        });
+    }
+});*/
+
+// 📌 ROUTE 11: Delete student CV (PROTECTED)
+app.delete('/api/student/cv', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        const [result] = await db.execute(
+            'UPDATE students SET cv_url = NULL, updated_at = NOW() WHERE user_id = ?',
+            [userId]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Student profile not found'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'CV deleted successfully'
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error deleting CV:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error deleting CV'
+        });
+    }
+});
+
+// 📌 ROUTE 12: Get student dashboard stats (PROTECTED)
+app.get('/api/student/stats', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Mock data for testing
+        res.json({
+            success: true,
+            stats: {
+                activeApplications: 3,
+                upcomingInterviews: 1,
+                savedInternships: 2
+            }
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error fetching stats:', error);
+        res.json({
+            success: true,
+            stats: {
+                activeApplications: 0,
+                upcomingInterviews: 0,
+                savedInternships: 0
+            }
+        });
+    }
+});
+
+
+
+// 📌 ROUTE 14: Mark notification as read (PROTECTED)
+app.put('/api/student/notifications/:id/read', protect, async (req, res) => {
+    try {
+        const notificationId = req.params.id;
+        const userId = req.user.id;
+        
+        // Mock implementation
+        res.json({
+            success: true,
+            message: 'Notification marked as read'
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error marking notification:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error updating notification'
+        });
+    }
+});
+
+
+// 📌 ROUTE 15: Get internships with filters (PROTECTED)
+app.get('/api/internships', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        
+        // Only students and admins can view internships
+        if (userType !== 'student' && userType !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Students only.'
+            });
+        }
+        
+        // Extract query parameters
+        const {
+            wilaya,
+            technology,
+            type,
+            remote,
+            search,
+            duration,
+            stipend,
+            datePosted
+        } = req.query;
+        
+        // Build SQL query with filters
+        let sql = `
+            SELECT 
+                i.*,
+                c.company_name,
+                IF(si.id IS NOT NULL, TRUE, FALSE) as has_applied
+            FROM internships i
+            JOIN companies c ON i.company_id = c.user_id
+            LEFT JOIN student_internships si ON i.id = si.internship_id AND si.student_id = ?
+            WHERE i.status = 'active'
+        `;
+        
+        const params = [userId];
+        
+        // Add filters dynamically
+        if (wilaya) {
+            sql += ' AND i.location = ?';
+            params.push(wilaya);
+        }
+        
+        if (technology) {
+            sql += ' AND JSON_CONTAINS(i.required_skills, ?)';
+            params.push(JSON.stringify(technology));
+        }
+        
+        if (type) {
+            sql += ' AND i.type = ?';
+            params.push(type);
+        }
+        
+        if (remote === 'true') {
+            sql += ' AND i.type = "remote"';
+        }
+        
+        if (search) {
+            sql += ' AND (i.title LIKE ? OR i.description LIKE ? OR c.company_name LIKE ?)';
+            const searchTerm = `%${search}%`;
+            params.push(searchTerm, searchTerm, searchTerm);
+        }
+        
+        if (duration) {
+            if (duration === '1-3') {
+                sql += ' AND i.duration BETWEEN 1 AND 3';
+            } else if (duration === '3-6') {
+                sql += ' AND i.duration BETWEEN 3 AND 6';
+            } else if (duration === '6+') {
+                sql += ' AND i.duration >= 6';
+            }
+        }
+        
+        if (stipend) {
+            if (stipend === 'paid') {
+                sql += ' AND i.stipend > 0';
+            } else if (stipend === 'unpaid') {
+                sql += ' AND i.stipend = 0';
+            } else if (stipend === 'negotiable') {
+                sql += ' AND i.stipend_type = "negotiable"';
+            }
+        }
+        
+        if (datePosted) {
+            const now = new Date();
+            let startDate;
+            
+            if (datePosted === 'today') {
+                startDate = new Date(now.setHours(0, 0, 0, 0));
+            } else if (datePosted === 'week') {
+                startDate = new Date(now.setDate(now.getDate() - 7));
+            } else if (datePosted === 'month') {
+                startDate = new Date(now.setMonth(now.getMonth() - 1));
+            }
+            
+            if (startDate) {
+                sql += ' AND i.created_at >= ?';
+                params.push(startDate);
+            }
+        }
+        
+        sql += ' ORDER BY i.created_at DESC';
+        
+        console.log('🔍 Fetching internships with filters:', req.query);
+        
+        // Execute query
+        const [internships] = await db.execute(sql, params);
+        
+        // Parse required_skills from JSON string to array
+        const parsedInternships = internships.map(internship => ({
+            ...internship,
+            required_skills: internship.required_skills ? JSON.parse(internship.required_skills) : [],
+            has_applied: Boolean(internship.has_applied)
+        }));
+        
+        res.json({
+            success: true,
+            internships: parsedInternships
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error fetching internships:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching internships',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+// 📌 ROUTE 16: Apply to internship (PROTECTED) - FIXED VERSION
+app.post('/api/student/applications', protect, async (req, res) => {
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        const { internship_id } = req.body;
+        
+        // Verify user is a student
+        if (userType !== 'student') {
+            await connection.rollback();
+            connection.release();
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Students only.'
+            });
+        }
+        
+        // Validate input
+        if (!internship_id) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Internship ID is required'
+            });
+        }
+        
+        // Check if internship exists and is active
+        const [internships] = await connection.execute(
+            'SELECT id, deadline, company_id FROM internships WHERE id = ? AND status = "active"',
+            [internship_id]
+        );
+        
+        if (internships.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({
+                success: false,
+                message: 'Internship not found or not active'
+            });
+        }
+        
+        const internship = internships[0];
+        
+        // Check if deadline has passed
+        if (internship.deadline && new Date(internship.deadline) < new Date()) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Application deadline has passed'
+            });
+        }
+        
+        // Check if student already applied
+        const [existingApplications] = await connection.execute(
+            'SELECT id FROM student_internships WHERE student_id = ? AND internship_id = ?',
+            [userId, internship_id]
+        );
+        
+        if (existingApplications.length > 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'You have already applied to this internship'
+            });
+        }
+        
+        // Check if student has completed profile
+        const [studentProfile] = await connection.execute(
+            'SELECT first_name, last_name, university FROM students WHERE user_id = ?',
+            [userId]
+        );
+        
+        if (studentProfile.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Please complete your profile before applying'
+            });
+        }
+        
+        const student = studentProfile[0];
+        
+        // ✅ CORRECT: Create application in student_internships table
+        const [applicationResult] = await connection.execute(
+            `INSERT INTO student_internships 
+            (student_id, internship_id, status, applied_at) 
+            VALUES (?, ?, 'pending', NOW())`,
+            [userId, internship_id]
+        );
+        
+        // Create notification for company
+        if (internship.company_id) {
+            await connection.execute(
+                `INSERT INTO notifications 
+                (user_id, title, message, type, is_read, created_at) 
+                VALUES (?, ?, ?, 'application', 0, NOW())`,
+                [
+                    internship.company_id,
+                    'New Application Received',
+                    `${student.first_name} ${student.last_name} from ${student.university} has applied to your internship.`
+                ]
+            );
+        }
+        
+        // Commit transaction
+        await connection.commit();
+        connection.release();
+        
+        console.log('✅ Application submitted:', {
+            student_id: userId,
+            internship_id: internship_id,
+            application_id: applicationResult.insertId
+        });
+        
+        res.json({
+            success: true,
+            message: 'Application submitted successfully!',
+            application_id: applicationResult.insertId
+        });
+        
+    } catch (error) {
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Error submitting application:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error submitting application',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+
+// 📌 ROUTE 17: Company create internship (PROTECTED)
+app.post('/api/company/internships', protect, async (req, res) => {
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        
+        // Verify user is a company
+        if (userType !== 'company') {
+            await connection.rollback();
+            connection.release();
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Companies only.'
+            });
+        }
+        
+        const {
+            title,
+            description,
+            location,
+            type,
+            duration,
+            stipend,
+            stipend_type,
+            required_skills,
+            requirements,
+            benefits,
+            deadline,
+            positions_available
+        } = req.body;
+        
+        // Validate required fields
+        if (!title || !description || !location || !type) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Title, description, location, and type are required'
+            });
+        }
+        
+        // Create internship
+        const [result] = await connection.execute(
+            `INSERT INTO internships 
+            (company_id, title, description, location, type, duration, stipend, 
+             stipend_type, required_skills, requirements, benefits, deadline, positions_available, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+            [
+                userId,
+                title,
+                description,
+                location,
+                type,
+                duration || null,
+                stipend || 0,
+                stipend_type || 'fixed',
+                required_skills ? JSON.stringify(required_skills) : null,
+                requirements || null,
+                benefits || null,
+                deadline || null,
+                positions_available || 1
+            ]
+        );
+        
+        await connection.commit();
+        connection.release();
+        
+        console.log('✅ Internship created:', {
+            company_id: userId,
+            internship_id: result.insertId,
+            title: title
+        });
+        
+        res.json({
+            success: true,
+            message: 'Internship created successfully!',
+            internship_id: result.insertId
+        });
+        
+    } catch (error) {
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Error creating internship:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error creating internship',
+            error: error.message
+        });
+    }
+});
+
+// 📌 ROUTE 18: Company get internships (PROTECTED)
+app.get('/api/company/internships', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        
+        // Verify user is a company
+        if (userType !== 'company') {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Companies only.'
+            });
+        }
+        
+        // Get internships for this company
+        const [internships] = await db.execute(
+            `SELECT i.*, 
+                (SELECT COUNT(*) FROM student_internships WHERE internship_id = i.id) as applications_count,
+                (SELECT COUNT(*) FROM student_internships WHERE internship_id = i.id AND status = 'pending') as pending_applications
+            FROM internships i
+            WHERE i.company_id = ?
+            ORDER BY i.created_at DESC`,
+            [userId]
+        );
+        
+        // Parse required_skills from JSON
+        const parsedInternships = internships.map(internship => ({
+            ...internship,
+            required_skills: internship.required_skills ? JSON.parse(internship.required_skills) : []
+        }));
+        
+        res.json({
+            success: true,
+            internships: parsedInternships
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error fetching company internships:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching internships'
+        });
+    }
+});
+
+// 📌 ROUTE 19: Get student applications - نسخة مصححة نهائياً
+app.get('/api/student/applications', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    console.log('📋 Fetching applications for user:', userId);
+    
+    const [applications] = await db.execute(`
+      SELECT 
+        si.id,
+        si.student_id,
+        si.internship_id,
+        si.status,
+        si.applied_at as applied_date,
+        si.reviewed_at,
+        si.feedback,
+        si.interview_date,
+        si.interview_time,
+        si.interview_mode,
+        ag.id as agreement_id,  -- ✅ ag هو اسم مستعار لـ agreements
+        i.title as internship_title,
+        i.type as internship_type,
+        i.location as internship_location,
+        i.duration,
+        i.stipend,
+        c.company_name,
+        c.company_email,
+        c.wilaya as company_location
+      FROM student_internships si
+      JOIN internships i ON si.internship_id = i.id
+      JOIN companies c ON i.company_id = c.user_id
+      LEFT JOIN agreements ag ON si.internship_id = ag.internship_id AND ag.student_id = si.student_id
+      WHERE si.student_id = ?
+      ORDER BY si.applied_at DESC
+    `, [userId]);
+    
+    console.log(`✅ Found ${applications.length} applications`);
+    
+    res.json({ 
+      success: true, 
+      applications 
+    });
+    
+  } catch (error) {
+    console.error('🔥 Error fetching applications:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching applications',
+      error: error.message 
+    });
+  }
+});
+
+// 📌 ROUTE 20: Withdraw application (PROTECTED) - UPDATED
+app.delete('/api/student/applications/:applicationId', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        const applicationId = req.params.applicationId;
+        
+        // Verify user is a student
+        if (userType !== 'student') {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Students only.'
+            });
+        }
+        
+        // Check if application exists and belongs to student
+        const [applications] = await db.execute(
+            'SELECT * FROM student_internships WHERE id = ? AND student_id = ?',
+            [applicationId, userId]
+        );
+        
+        if (applications.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found'
+            });
+        }
+        
+        const application = applications[0];
+        
+        // Check if application can be withdrawn (only pending or reviewed)
+        if (!['pending', 'reviewed'].includes(application.status)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot withdraw application in "${application.status}" status`
+            });
+        }
+        
+        // Delete the application
+        await db.execute(
+            'DELETE FROM student_internships WHERE id = ?',
+            [applicationId]
+        );
+        
+        // Create notification for company
+        const [internshipInfo] = await db.execute(
+            'SELECT company_id, title FROM internships WHERE id = ?',
+            [application.internship_id]
+        );
+        
+        if (internshipInfo.length > 0) {
+            const companyId = internshipInfo[0].company_id;
+            const internshipTitle = internshipInfo[0].title;
+            
+            // Get student name for notification
+            const [studentInfo] = await db.execute(
+                'SELECT first_name, last_name FROM students WHERE user_id = ?',
+                [userId]
+            );
+            
+            if (studentInfo.length > 0) {
+                const studentName = `${studentInfo[0].first_name} ${studentInfo[0].last_name}`;
+                
+                await db.execute(
+                    `INSERT INTO notifications 
+                    (user_id, title, message, type, is_read, created_at) 
+                    VALUES (?, ?, ?, 'application', 0, NOW())`,
+                    [
+                        companyId,
+                        'Application Withdrawn',
+                        `${studentName} has withdrawn their application for "${internshipTitle}".`
+                    ]
+                );
+            }
+        }
+        
+        console.log('✅ Application withdrawn:', {
+            application_id: applicationId,
+            student_id: userId
+        });
+        
+        res.json({
+            success: true,
+            message: 'Application withdrawn successfully'
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error withdrawing application:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error withdrawing application',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+
+
+// ============================================
+// 📌 Accept internship offer
+// ============================================
+app.put('/api/student/applications/:id/accept', protect, async (req, res) => {
+  try {
+    const studentId = req.user.id;
+    const applicationId = req.params.id;
+    
+    console.log(`✅ Accepting offer for application ${applicationId} by student ${studentId}`);
+    
+    // التحقق من أن التطبيق موجود وخاص بهذا الطالب
+    const [applications] = await db.execute(
+      'SELECT si.*, i.title as internship_title FROM student_internships si JOIN internships i ON si.internship_id = i.id WHERE si.id = ? AND si.student_id = ?',
+      [applicationId, studentId]
+    );
+    
+    if (applications.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Application not found' 
+      });
+    }
+    
+    const application = applications[0];
+    
+    // تحديث حالة التطبيق إلى accepted
+    await db.execute(
+      'UPDATE student_internships SET status = "accepted", updated_at = NOW() WHERE id = ?',
+      [applicationId]
+    );
+    
+    // إنشاء إشعار للطالب
+    await db.execute(
+      `INSERT INTO notifications (user_id, title, message, type, created_at) 
+       VALUES (?, ?, ?, 'acceptance', NOW())`,
+      [
+        studentId,
+        'Offer Accepted',
+        `You have successfully accepted the offer for ${application.internship_title}.`
+      ]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Offer accepted successfully' 
+    });
+    
+  } catch (error) {
+    console.error('🔥 Error accepting offer:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error accepting offer',
+      error: error.message 
+    });
+  }
+});
+
+
+// 📌 ROUTE 21: Update application status (PROTECTED) - UPDATED
+app.put('/api/company/applications/:applicationId/status', protect, async (req, res) => {
+    const connection = await db.getConnection();
+    
+    try {
+        await connection.beginTransaction();
+        
+        const companyUserId = req.user.id;
+        const userType = req.user.user_type;
+        const applicationId = req.params.applicationId;
+        const { status, feedback, interview_date, interview_time, interview_mode } = req.body;
+        
+        // Verify user is a company
+        if (userType !== 'company') {
+            await connection.rollback();
+            connection.release();
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Companies only.'
+            });
+        }
+        
+        // Validate status
+        const validStatuses = ['pending', 'reviewed', 'interview', 'accepted', 'rejected'];
+        if (!validStatuses.includes(status)) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid status'
+            });
+        }
+        
+        // Check if application exists and belongs to company's internship
+        const [applications] = await connection.execute(
+            `SELECT si.*, i.title as internship_title 
+            FROM student_internships si
+            JOIN internships i ON si.internship_id = i.id
+            WHERE si.id = ? AND i.company_id = ?`,
+            [applicationId, companyUserId]
+        );
+        
+        if (applications.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({
+                success: false,
+                message: 'Application not found or unauthorized'
+            });
+        }
+        
+        const application = applications[0];
+        
+        // Update application - check if interview columns exist
+        let updateFields = [];
+        const updateValues = [];
+        
+        // First check if interview_date column exists
+        const [columns] = await connection.execute(
+            "SHOW COLUMNS FROM student_internships LIKE 'interview_date'"
+        );
+        
+        const hasInterviewFields = columns.length > 0;
+        
+        updateFields.push('status = ?');
+        updateValues.push(status);
+        
+        if (feedback) {
+            updateFields.push('feedback = ?');
+            updateValues.push(feedback);
+        }
+        
+        // Add reviewed_at timestamp when status changes to reviewed
+        if (status === 'reviewed') {
+            updateFields.push('reviewed_at = NOW()');
+        }
+        
+        // Handle interview scheduling
+        if (status === 'interview' && hasInterviewFields) {
+            if (!interview_date) {
+                await connection.rollback();
+                connection.release();
+                return res.status(400).json({
+                    success: false,
+                    message: 'Interview date is required'
+                });
+            }
+            
+            updateFields.push('interview_date = ?');
+            updateFields.push('interview_time = ?');
+            updateFields.push('interview_mode = ?');
+            updateValues.push(interview_date, interview_time, interview_mode);
+        }
+        
+        updateValues.push(applicationId);
+        
+        await connection.execute(
+            `UPDATE student_internships 
+            SET ${updateFields.join(', ')} 
+            WHERE id = ?`,
+            updateValues
+        );
+        
+        // Create notification for student
+        const [studentInfo] = await connection.execute(
+            `SELECT s.user_id, s.first_name, s.last_name 
+            FROM students s 
+            WHERE s.user_id = ?`,
+            [application.student_id]
+        );
+        
+        if (studentInfo.length > 0) {
+            const studentUserId = studentInfo[0].user_id;
+            const studentName = `${studentInfo[0].first_name} ${studentInfo[0].last_name}`;
+            let notificationTitle = '';
+            let notificationMessage = '';
+            let notificationType = 'application_update';
+            
+            switch(status) {
+                case 'reviewed':
+                    notificationTitle = 'Application Under Review';
+                    notificationMessage = `Your application for "${application.internship_title}" is now under review.`;
+                    break;
+                case 'interview':
+                    notificationTitle = 'Interview Scheduled';
+                    notificationMessage = `Congratulations! You've been invited for an interview for "${application.internship_title}".`;
+                    notificationType = 'interview';
+                    break;
+                case 'accepted':
+                    notificationTitle = 'Application Accepted!';
+                    notificationMessage = `🎉 Congratulations! Your application for "${application.internship_title}" has been accepted!`;
+                    notificationType = 'acceptance';
+                    break;
+                case 'rejected':
+                    notificationTitle = 'Application Update';
+                    notificationMessage = `Your application for "${application.internship_title}" has been reviewed.`;
+                    notificationType = 'rejection';
+                    break;
+                default:
+                    notificationTitle = 'Application Update';
+                    notificationMessage = `Your application for "${application.internship_title}" has been updated.`;
+            }
+            
+            await connection.execute(
+                `INSERT INTO notifications 
+                (user_id, title, message, type, is_read, created_at) 
+                VALUES (?, ?, ?, ?, 0, NOW())`,
+                [studentUserId, notificationTitle, notificationMessage, notificationType]
+            );
+        }
+        
+        await connection.commit();
+        connection.release();
+        
+        console.log('✅ Application status updated:', {
+            application_id: applicationId,
+            new_status: status,
+            company_id: companyUserId
+        });
+        
+        res.json({
+            success: true,
+            message: 'Application status updated successfully'
+        });
+        
+    } catch (error) {
+        await connection.rollback();
+        connection.release();
+        
+        console.error('🔥 Error updating application status:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error updating application status',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+
+
+// 📌 ROUTE 22: Get company applications (PROTECTED) - UPDATED
+app.get('/api/company/applications', protect, async (req, res) => {
+    try {
+        const companyUserId = req.user.id;
+        const userType = req.user.user_type;
+        
+        // Verify user is a company
+        if (userType !== 'company') {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Companies only.'
+            });
+        }
+        
+        const { internship_id, status } = req.query;
+        
+        // Build query based on your schema
+        let sql = `
+            SELECT 
+                si.id,
+                si.status,
+                si.applied_at,
+                si.reviewed_at,
+                si.feedback,
+                si.interview_date,
+                si.interview_time,
+                si.interview_mode,
+                s.user_id as student_user_id,
+                s.first_name,
+                s.last_name,
+                s.university,
+                s.specialization,
+                s.year_of_study,
+                s.skills,
+                s.cv_url,
+                s.github_link,
+                s.linkedin_link,
+                s.phone,
+                s.university_email,
+                i.id as internship_id,
+                i.title as internship_title,
+                i.type as internship_type,
+                i.location as internship_location
+            FROM student_internships si
+            JOIN internships i ON si.internship_id = i.id
+            JOIN students s ON si.student_id = s.user_id
+            WHERE i.company_id = ?
+        `;
+        
+        const params = [companyUserId];
+        
+        if (internship_id) {
+            sql += ' AND i.id = ?';
+            params.push(internship_id);
+        }
+        
+        if (status) {
+            sql += ' AND si.status = ?';
+            params.push(status);
+        }
+        
+        sql += ' ORDER BY si.applied_at DESC';
+        
+        const [applications] = await db.execute(sql, params);
+        
+        // Parse skills from JSON
+        const parsedApplications = applications.map(app => ({
+            ...app,
+            skills: app.skills ? (typeof app.skills === 'string' ? JSON.parse(app.skills) : app.skills) : [],
+            full_name: `${app.first_name} ${app.last_name}`,
+            email: app.university_email || app.email
+        }));
+        
+        res.json({
+            success: true,
+            applications: parsedApplications
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error fetching company applications:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching applications',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+
+
+// 📌 ROUTE 25: Mark notification as read (PROTECTED) - UPDATED
+app.put('/api/student/notifications/:id/read', protect, async (req, res) => {
+    try {
+        const notificationId = req.params.id;
+        const userId = req.user.id;
+        
+        // Mark notification as read
+        const [result] = await db.execute(
+            'UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?',
+            [notificationId, userId]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Notification not found'
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Notification marked as read'
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error marking notification:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error updating notification'
+        });
+    }
+});
+
+// ============================================
+// 📌 ROUTE: Send notification (لجميع الأنواع)
+// ============================================
+app.post('/api/notifications/send', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+    
+    const { user_id, user_type, type, title, message, application_id, ...rest } = req.body;
+    
+    console.log('📨 Sending notification:', { user_type, type, title });
+    
+    // تحضير البيانات الإضافية
+    const data = JSON.stringify(rest || {});
+    let result;
+    
+    // إرسال حسب نوع المستخدم
+    switch(user_type) {
+      case 'student':
+        if (!user_id) {
+          await connection.rollback();
+          connection.release();
+          return res.status(400).json({ 
+            success: false, 
+            message: 'user_id is required for student notifications' 
+          });
+        }
+        
+        [result] = await connection.execute(
+          `INSERT INTO notifications 
+           (user_id, type, title, message, application_id, data, is_read, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, 0, NOW())`,
+          [user_id, type, title, message, application_id, data]
+        );
+        break;
+
+      case 'admin':
+        [result] = await connection.execute(
+          `INSERT INTO admin_notifications 
+           (type, title, message, application_id, data, is_read, created_at) 
+           VALUES (?, ?, ?, ?, ?, 0, NOW())`,
+          [type, title, message, application_id, data]
+        );
+        break;
+
+      case 'company':
+        if (!user_id) {
+          await connection.rollback();
+          connection.release();
+          return res.status(400).json({ 
+            success: false, 
+            message: 'user_id is required for company notifications' 
+          });
+        }
+        
+        [result] = await connection.execute(
+          `INSERT INTO company_notifications 
+           (company_id, type, title, message, application_id, data, is_read, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, 0, NOW())`,
+          [user_id, type, title, message, application_id, data]
+        );
+        break;
+
+      default:
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Invalid user_type. Must be student, admin, or company.' 
+        });
+    }
+    
+    await connection.commit();
+    connection.release();
+    
+    res.json({ 
+      success: true, 
+      message: 'Notification sent successfully',
+      notificationId: result?.insertId 
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    
+    console.error('❌ Error sending notification:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error sending notification',
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Get admin notifications
+// ============================================
+app.get('/api/admin/notifications', protect, async (req, res) => {
+  try {
+    // Verify user is admin
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Admin only.' 
+      });
+    }
+
+    const [notifications] = await db.execute(
+      `SELECT * FROM admin_notifications 
+       ORDER BY created_at DESC`,
+      []
+    );
+
+    res.json({
+      success: true,
+      notifications
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching admin notifications:', error);
+    res.json({ 
+      success: true, 
+      notifications: [] 
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Update notification data (للإدارة)
+// ============================================
+app.put('/api/admin/notifications/:id/update-data', protect, async (req, res) => {
+  try {
+    // Verify user is admin
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Admin only.' 
+      });
+    }
+
+    const notificationId = req.params.id;
+    const updateData = req.body; // { validated: true } أو { agreement_generated: true }
+
+    // جلب الإشعار الحالي
+    const [notifications] = await db.execute(
+      'SELECT data FROM admin_notifications WHERE id = ?',
+      [notificationId]
+    );
+
+    if (notifications.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+
+    // دمج البيانات الجديدة مع القديمة
+    let currentData = {};
+    try {
+      currentData = JSON.parse(notifications[0].data || '{}');
+    } catch (e) {
+      currentData = {};
+    }
+
+    const newData = { ...currentData, ...updateData };
+    const dataString = JSON.stringify(newData);
+
+    // تحديث البيانات
+    await db.execute(
+      'UPDATE admin_notifications SET data = ? WHERE id = ?',
+      [dataString, notificationId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Notification data updated successfully'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error updating notification data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notification data'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Mark admin notification as read
+// ============================================
+app.put('/api/admin/notifications/:id/read', protect, async (req, res) => {
+  try {
+    // Verify user is admin
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Admin only.' 
+      });
+    }
+
+    const notificationId = req.params.id;
+
+    const [result] = await db.execute(
+      'UPDATE admin_notifications SET is_read = 1 WHERE id = ?',
+      [notificationId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Notification marked as read'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error marking notification:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notification'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Mark all admin notifications as read
+// ============================================
+app.put('/api/admin/notifications/read-all', protect, async (req, res) => {
+  try {
+    // Verify user is admin
+    if (req.user.user_type !== 'admin') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Admin only.' 
+      });
+    }
+
+    await db.execute(
+      'UPDATE admin_notifications SET is_read = 1'
+    );
+
+    res.json({
+      success: true,
+      message: 'All notifications marked as read'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error marking all notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notifications'
+    });
+  }
+});
+
+
+
+
+
+// 📌 ROUTE 26: Get single internship details (PROTECTED)
+app.get('/api/internships/:id', protect, async (req, res) => {
+    console.log('🔍 ROUTE 26 called with ID:', req.params.id);
+    
+    try {
+        const userId = req.user.id;
+        const userType = req.user.user_type;
+        const internshipId = req.params.id;
+        
+        console.log('User:', { userId, userType, internshipId });
+        
+        // Only students and admins can view internship details
+        if (userType !== 'student' && userType !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: 'Access denied. Students only.'
+            });
+        }
+        
+        // Get internship with company details
+        const [internships] = await db.execute(
+            `SELECT 
+                i.*,
+                c.company_name,
+                c.company_email,
+                c.phone,
+                c.website,
+                c.wilaya as company_location,
+                c.address as company_address,
+                c.contact_person,
+                c.description as company_description,
+                IF(si.id IS NOT NULL, TRUE, FALSE) as has_applied,
+                si.status as application_status
+            FROM internships i
+            JOIN companies c ON i.company_id = c.user_id
+            LEFT JOIN student_internships si ON i.id = si.internship_id AND si.student_id = ?
+            WHERE i.id = ? AND i.status = 'active'`,
+            [userId, internshipId]
+        );
+        
+        if (internships.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Internship not found'
+            });
+        }
+        
+        const internship = internships[0];
+        
+        // Parse required_skills from JSON
+        internship.required_skills = internship.required_skills ? JSON.parse(internship.required_skills) : [];
+        
+        // Parse requirements and benefits if they are JSON
+        try {
+            internship.requirements = internship.requirements ? JSON.parse(internship.requirements) : [];
+            internship.benefits = internship.benefits ? JSON.parse(internship.benefits) : [];
+        } catch (e) {
+            // If not JSON, keep as string
+            internship.requirements = internship.requirements || '';
+            internship.benefits = internship.benefits || '';
+        }
+        
+        // Get similar internships
+        const [similarInternships] = await db.execute(
+            `SELECT 
+                i.id,
+                i.title,
+                i.type,
+                i.location,
+                i.duration,
+                i.stipend,
+                c.company_name,
+                c.wilaya as company_location
+            FROM internships i
+            JOIN companies c ON i.company_id = c.user_id
+            WHERE i.id != ? 
+            AND i.status = 'active'
+            AND (i.type = ? OR i.location = ?)
+            LIMIT 3`,
+            [internshipId, internship.type, internship.location]
+        );
+        
+        res.json({
+            success: true,
+            internship: internship,
+            similarInternships: similarInternships
+        });
+        
+    } catch (error) {
+        console.error('🔥 Error fetching internship details:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching internship details',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+        });
+    }
+});
+
+// ============================================
+// 📌 GET similar internships for comparison
+// ============================================
+app.get('/api/internships/:id/similar', protect, async (req, res) => {
+  try {
+    const internshipId = req.params.id;
+    
+    // جلب التدريب الحالي لمعرفة مهاراته
+    const [internships] = await db.execute(
+      `SELECT required_skills, type, location, duration FROM internships WHERE id = ?`,
+      [internshipId]
+    );
+    
+    if (internships.length === 0) {
+      return res.json({ success: true, similar: [] });
+    }
+    
+    const current = internships[0];
+    let skills = [];
+    
+    if (current.required_skills) {
+      try {
+        skills = JSON.parse(current.required_skills);
+      } catch (e) {
+        skills = [];
+      }
+    }
+    
+    console.log('🔍 Searching for similar internships:', {
+      type: current.type,
+      location: current.location,
+      skills: skills,
+      duration: current.duration
+    });
+    
+    // جلب تدريبات مشابهة (معايير أوسع)
+    const [similar] = await db.execute(
+      `SELECT 
+        i.id,
+        i.title,
+        i.type,
+        i.location,
+        i.duration,
+        i.stipend,
+        i.description,
+        i.required_skills,
+        c.company_name
+      FROM internships i
+      JOIN companies c ON i.company_id = c.user_id
+      WHERE i.id != ? 
+        AND i.status = 'active'
+        AND (
+          i.type = ? 
+          OR (i.location IS NOT NULL AND i.location LIKE ?)
+          OR JSON_OVERLAPS(i.required_skills, ?)
+          OR (i.duration IS NOT NULL AND i.duration BETWEEN ? AND ?)
+        )
+      LIMIT 3`,
+      [
+        internshipId, 
+        current.type || '', 
+        `%${current.location || ''}%`, 
+        JSON.stringify(skills || []),
+        Math.max(1, (current.duration || 3) - 1),
+        (current.duration || 3) + 1
+      ]
+    );
+    
+    console.log(`✅ Found ${similar.length} similar internships`);
+    
+    // تنسيق المهارات
+    const formatted = similar.map(item => ({
+      ...item,
+      required_skills: item.required_skills ? JSON.parse(item.required_skills) : []
+    }));
+    
+    res.json({
+      success: true,
+      similar: formatted
+    });
+    
+  } catch (error) {
+    console.error('🔥 Error fetching similar internships:', error);
+    res.json({ success: true, similar: [] });
+  }
+});
+
+// ============================================
+// GET student settings
+// ============================================
+app.get('/api/student/settings', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // هنا يمكنك جلب الإعدادات من قاعدة البيانات
+    // مؤقتاً: نرجع إعدادات افتراضية
+    
+    res.json({
+      success: true,
+      settings: {
+        account: {
+          emailNotifications: true,
+          applicationUpdates: true,
+          deadlineReminders: true,
+          newMatches: true,
+          newsletter: false
+        },
+        privacy: {
+          profileVisibility: 'public',
+          showContactInfo: true,
+          allowMessages: true,
+          showSavedInternships: false,
+          showApplications: true,
+          dataSharing: true
+        },
+        preferences: {
+          preferredLocations: [],
+          internshipTypes: ['remote', 'part-time', 'full-time'],
+          minStipend: 0,
+          notificationFrequency: 'instant',
+          language: 'en',
+          theme: 'light'
+        },
+        security: {
+          twoFactorEnabled: false,
+          loginAlerts: true,
+          deviceManagement: true,
+          sessionTimeout: 30
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching settings:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ============================================
+// PUT update student settings
+// ============================================
+app.put('/api/student/settings', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const settingsData = req.body;
+    
+    // هنا يمكنك حفظ الإعدادات في قاعدة البيانات
+    
+    res.json({
+      success: true,
+      message: 'Settings saved successfully'
+    });
+  } catch (error) {
+    console.error('Error saving settings:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ============================================
+// PUT change password
+// ============================================
+app.put('/api/student/change-password', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { currentPassword, newPassword } = req.body;
+    
+    // هنا يمكنك تغيير كلمة المرور
+    
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({ success: false, message: 'Error changing password' });
+  }
+});
+
+// ============================================
+// DELETE student account
+// ============================================
+app.delete('/api/student/account', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // هنا يمكنك حذف الحساب
+    
+    res.json({
+      success: true,
+      message: 'Account deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting account:', error);
+    res.status(500).json({ success: false, message: 'Error deleting account' });
+  }
+});
+
+
+
+// ============================================
+// 📌 ROUTES 27-33: SAVED INTERNSHIPS (PROTECTED)
+// ============================================
+
+// 📌 ROUTE 27: GET all saved internships for student
+app.get('/api/student/saved-internships', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    // Check if saved_internships table exists
+    const [tables] = await db.execute(
+      "SHOW TABLES LIKE 'saved_internships'"
+    );
+    
+    if (tables.length === 0) {
+      // Create table if not exists
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS saved_internships (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          student_id INT NOT NULL,
+          internship_id INT NOT NULL,
+          saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          notes TEXT,
+          FOREIGN KEY (student_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (internship_id) REFERENCES internships(id) ON DELETE CASCADE,
+          UNIQUE KEY unique_save (student_id, internship_id)
+        )
+      `);
+    }
+
+    // Get saved internships with details
+    const [saved] = await db.execute(
+      `SELECT 
+        si.id,
+        si.saved_at,
+        si.notes,
+        i.id as internship_id,
+        i.title as internship_title,
+        i.type as internship_type,
+        i.location,
+        i.duration,
+        i.stipend,
+        i.description,
+        i.deadline as deadline,
+        i.required_skills,
+        c.company_name,
+        c.logo_url as company_logo,  
+        c.wilaya as company_location
+      FROM saved_internships si
+      JOIN internships i ON si.internship_id = i.id
+      JOIN companies c ON i.company_id = c.user_id
+      WHERE si.student_id = ?
+      ORDER BY si.saved_at DESC`,
+      [req.user.id]
+    );
+
+    // Format the response
+    const formatted = saved.map(item => ({
+      id: item.id,
+      internship_id: item.internship_id,
+      internship_title: item.internship_title,
+      internship_type: item.type || 'full-time',
+      company_name: item.company_name || 'Unknown Company',
+      company_logo: item.company_logo,
+      location: item.location,
+      duration: item.duration || 3,
+      stipend: item.stipend,
+      deadline: item.deadline,
+      description: item.description,
+      required_skills: item.required_skills ? JSON.parse(item.required_skills) : [],
+      saved_at: item.saved_at,
+      notes: item.notes
+    }));
+
+    res.json({
+      success: true,
+      savedInternships: formatted
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching saved internships:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching saved internships',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+
+// 📌 ROUTE 28: POST save an internship
+app.post('/api/student/saved-internships/:internshipId', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      await connection.rollback();
+      connection.release();
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    const { internshipId } = req.params;
+
+    // Check if internship exists
+    const [internships] = await connection.execute(
+      'SELECT id FROM internships WHERE id = ? AND status = "active"',
+      [internshipId]
+    );
+
+    if (internships.length === 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Internship not found' 
+      });
+    }
+
+    // Check if already saved
+    const [existing] = await connection.execute(
+      'SELECT id FROM saved_internships WHERE student_id = ? AND internship_id = ?',
+      [req.user.id, internshipId]
+    );
+
+    if (existing.length > 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Internship already saved' 
+      });
+    }
+
+    // Save internship
+    const [result] = await connection.execute(
+      `INSERT INTO saved_internships 
+      (student_id, internship_id, saved_at) 
+      VALUES (?, ?, NOW())`,
+      [req.user.id, internshipId]
+    );
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: 'Internship saved successfully',
+      saved_id: result.insertId
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    
+    console.error('🔥 Error saving internship:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error saving internship',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// 📌 ROUTE 29: DELETE remove a saved internship
+app.delete('/api/student/saved-internships/:internshipId', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    const { internshipId } = req.params;
+
+    await db.execute(
+      'DELETE FROM saved_internships WHERE student_id = ? AND internship_id = ?',
+      [req.user.id, internshipId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Internship removed from saved'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error removing saved internship:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error removing saved internship',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// 📌 ROUTE 30: DELETE remove all saved internships
+app.delete('/api/student/saved-internships', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    await db.execute(
+      'DELETE FROM saved_internships WHERE student_id = ?',
+      [req.user.id]
+    );
+
+    res.json({
+      success: true,
+      message: 'All saved internships removed'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error removing all saved internships:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error removing all saved internships',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// 📌 ROUTE 31: GET check if internship is saved
+app.get('/api/student/saved-internships/check/:internshipId', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    const { internshipId } = req.params;
+
+    const [saved] = await db.execute(
+      'SELECT id FROM saved_internships WHERE student_id = ? AND internship_id = ?',
+      [req.user.id, internshipId]
+    );
+
+    res.json({
+      success: true,
+      isSaved: saved.length > 0,
+      saved_id: saved[0]?.id
+    });
+
+  } catch (error) {
+    console.error('🔥 Error checking saved status:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error checking saved status',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// 📌 ROUTE 32: PUT add notes to saved internship
+app.put('/api/student/saved-internships/:internshipId/notes', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    const { internshipId } = req.params;
+    const { notes } = req.body;
+
+    const [result] = await db.execute(
+      'UPDATE saved_internships SET notes = ? WHERE student_id = ? AND internship_id = ?',
+      [notes, req.user.id, internshipId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Saved internship not found' 
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Notes added successfully'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error adding notes:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error adding notes',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// 📌 ROUTE 33: GET recommendations based on saved internships
+app.get('/api/student/saved-internships/recommendations', protect, async (req, res) => {
+  try {
+    // Verify user is student
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Student only.' 
+      });
+    }
+
+    // Get user's saved internships skills
+    const [saved] = await db.execute(
+      `SELECT i.required_skills, i.location, i.type 
+       FROM saved_internships si
+       JOIN internships i ON si.internship_id = i.id
+       WHERE si.student_id = ?`,
+      [req.user.id]
+    );
+
+    if (saved.length === 0) {
+      return res.json({
+        success: true,
+        recommendations: []
+      });
+    }
+
+    // Extract skills and locations
+    const skills = new Set();
+    const locations = new Set();
+    const types = new Set();
+
+    saved.forEach(item => {
+      if (item.required_skills) {
+        try {
+          JSON.parse(item.required_skills).forEach(skill => skills.add(skill));
+        } catch (e) {}
+      }
+      if (item.location) locations.add(item.location);
+      if (item.type) types.add(item.type);
+    });
+
+    // Get saved IDs to exclude
+    const [savedIds] = await db.execute(
+      'SELECT internship_id FROM saved_internships WHERE student_id = ?',
+      [req.user.id]
+    );
+    const excludedIds = savedIds.map(s => s.internship_id);
+    excludedIds.push(0); // Add 0 to avoid empty array
+
+    // Find recommendations
+    const [recommendations] = await db.execute(
+      `SELECT 
+        i.id,
+        i.title,
+        i.type,
+        i.location,
+        i.stipend,
+        i.required_skills,
+        c.company_name
+      FROM internships i
+      JOIN companies c ON i.company_id = c.user_id
+      WHERE i.id NOT IN (?)
+        AND i.status = 'active'
+        AND (
+          JSON_OVERLAPS(i.required_skills, ?) 
+          OR i.location IN (?)
+          OR i.type IN (?)
+        )
+      LIMIT 6`,
+      [
+        excludedIds,
+        JSON.stringify(Array.from(skills)),
+        Array.from(locations),
+        Array.from(types)
+      ]
+    );
+
+    // Calculate match score
+    const formatted = recommendations.map(internship => {
+      let score = 0;
+      const internshipSkills = internship.required_skills ? JSON.parse(internship.required_skills) : [];
+      
+      // Match by skills (70%)
+      if (internshipSkills.length > 0 && skills.size > 0) {
+        const matchingSkills = internshipSkills.filter(skill => skills.has(skill)).length;
+        score += (matchingSkills / Math.max(internshipSkills.length, 1)) * 70;
+      }
+      
+      // Match by location (15%)
+      if (locations.has(internship.location)) {
+        score += 15;
+      }
+      
+      // Match by type (15%)
+      if (types.has(internship.type)) {
+        score += 15;
+      }
+
+      return {
+        id: internship.id,
+        title: internship.title,
+        company: internship.company_name,
+        location: internship.location,
+        type: internship.type,
+        stipend: internship.stipend,
+        required_skills: internshipSkills,
+        match_score: Math.round(score)
+      };
+    });
+
+    // Sort by match score
+    formatted.sort((a, b) => b.match_score - a.match_score);
+
+    res.json({
+      success: true,
+      recommendations: formatted.slice(0, 3)
+    });
+
+  } catch (error) {
+    console.error('🔥 Error getting recommendations:', error);
+    res.json({ 
+      success: true, 
+      recommendations: [] 
+    });
+  }
+});
+
+
+// ============================================
+// 📌 GET student agreements
+// ============================================
+app.get('/api/student/agreements', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // التحقق من أن المستخدم طالب
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Students only.' 
+      });
+    }
+
+    // جلب الاتفاقيات الخاصة بالطالب مع تفاصيل التدريب والشركة
+    const [agreements] = await db.execute(`
+      SELECT 
+        a.id,
+        a.student_id,
+        a.internship_id,
+        a.status,
+        a.generated_at,
+        a.sent_at,
+        a.signed_at,
+        a.archived_at,
+        a.pdf_url,
+        a.university_name,
+        a.created_at,
+        CONCAT(s.first_name, ' ', s.last_name) as student_name,
+        i.title as internship_title,
+        i.description,
+        i.duration,
+        i.stipend,
+        i.location,
+        i.type as internship_type,
+        c.company_name,
+        c.id as company_id
+      FROM agreements a
+      JOIN internships i ON a.internship_id = i.id
+      JOIN companies c ON i.company_id = c.user_id
+      JOIN students s ON a.student_id = s.user_id
+      WHERE a.student_id = ?
+      ORDER BY a.created_at DESC
+    `, [userId]);
+
+    console.log(`📄 Found ${agreements.length} agreements for student ${userId}`);
+
+    res.json({
+      success: true,
+      agreements
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching student agreements:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching agreements',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// ============================================
+// 📌 GET single agreement by ID
+// ============================================
+app.get('/api/student/agreements/:agreementId', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const agreementId = req.params.agreementId;
+    
+    console.log(`🔍 Fetching agreement ${agreementId} for user ${userId}`);
+    
+    // التحقق من أن المستخدم طالب
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Students only.' 
+      });
+    }
+
+    // جلب الاتفاقية مع التفاصيل
+    const [agreements] = await db.execute(`
+      SELECT 
+        a.id,
+        a.student_id,
+        a.internship_id,
+        a.status,
+        a.generated_at,
+        a.sent_at,
+        a.signed_at,
+        a.archived_at,
+        a.pdf_url,
+        a.university_name,
+        a.created_at,
+        CONCAT(s.first_name, ' ', s.last_name) as student_name,
+        i.title as internship_title,
+        i.description,
+        i.duration,
+        i.stipend,
+        i.location,
+        i.start_date,
+        i.end_date,
+        i.type as internship_type,
+        c.company_name,
+        c.id as company_id
+      FROM agreements a
+      JOIN internships i ON a.internship_id = i.id
+      JOIN companies c ON i.company_id = c.user_id
+      JOIN students s ON a.student_id = s.user_id
+      WHERE a.id = ? AND a.student_id = ?
+    `, [agreementId, userId]);
+
+    if (agreements.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Agreement not found' 
+      });
+    }
+
+    console.log(`✅ Found agreement: ${agreements[0].id}`);
+
+    res.json({
+      success: true,
+      agreement: agreements[0]
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching agreement:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching agreement',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+
+// ============================================
+// 📌 Download agreement PDF
+// ============================================
+app.get('/api/student/agreements/:agreementId/download', protect, async (req, res) => {
+  try {
+    const studentId = req.user.id;
+    const agreementId = req.params.agreementId;
+    
+    console.log(`📥 Downloading agreement ${agreementId} for student ${studentId}`);
+    
+    // التحقق من أن المستخدم طالب
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Students only.' 
+      });
+    }
+    
+    // التحقق من أن الاتفاقية موجودة وتخص هذا الطالب
+    const [agreements] = await db.execute(
+      `SELECT a.*, i.title 
+       FROM agreements a
+       JOIN internships i ON a.internship_id = i.id
+       WHERE a.id = ? AND a.student_id = ?`,
+      [agreementId, studentId]
+    );
+    
+    if (agreements.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Agreement not found' 
+      });
+    }
+    
+    const agreement = agreements[0];
+    
+    // إذا كان هناك ملف PDF حقيقي وليس الملف التجريبي
+    if (agreement.pdf_url && !agreement.pdf_url.includes('test_agreement')) {
+      const filePath = path.join(__dirname, agreement.pdf_url);
+      
+      // التحقق من وجود الملف
+      if (fs.existsSync(filePath)) {
+        return res.download(filePath, `agreement_${agreementId}.pdf`);
+      }
+    }
+    
+    // إذا لم يكن هناك ملف حقيقي، أنشئ PDF بسيط
+    console.log('📄 Generating PDF for agreement', agreementId);
+    
+    const PDFDocument = require('pdfkit');
+    const doc = new PDFDocument();
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=agreement_${agreementId}.pdf`);
+    
+    doc.pipe(res);
+    
+    // محتوى PDF
+    doc.fontSize(20).text('INTERNSHIP AGREEMENT', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(12).text(`Date: ${new Date().toLocaleDateString()}`);
+    doc.moveDown();
+    doc.text(`This agreement is for internship: ${agreement.title || 'Internship'}`);
+    doc.text(`Generated on: ${new Date(agreement.generated_at).toLocaleDateString()}`);
+    doc.moveDown();
+    doc.text('Terms and Conditions:');
+    doc.fontSize(10).text('1. The student agrees to complete the internship period as specified.');
+    doc.text('2. The company agrees to provide necessary training and supervision.');
+    doc.text('3. Both parties agree to maintain confidentiality.');
+    doc.text(`4. The internship will start on ${new Date().toLocaleDateString()}.`);
+    doc.moveDown();
+    doc.text('Signed: _________________________', { align: 'left' });
+    doc.text('Student', { align: 'left' });
+    
+    doc.end();
+    
+  } catch (error) {
+    console.error('🔥 Error downloading agreement:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error downloading agreement',
+      error: error.message 
+    });
+  }
+});
+
+
+
+
+
+//company
+// ============================================
+// 📌 ROUTE: GET company profile for editing
+// ============================================
+app.get('/api/company/profile', protect, async (req, res) => {
+  try {
+    // Verify user is company
+    if (req.user.user_type !== 'company') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+
+    // Get company profile
+    const [companies] = await db.execute(
+      `SELECT 
+        c.*,
+        u.email,
+        u.created_at as account_created_at
+      FROM companies c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.user_id = ?`,
+      [userId]
+    );
+
+    if (companies.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Company profile not found'
+      });
+    }
+
+    const company = companies[0];
+
+    // Parse JSON fields
+    let social_media = {};
+    if (company.social_media) {
+      try {
+        social_media = typeof company.social_media === 'string' 
+          ? JSON.parse(company.social_media) 
+          : company.social_media;
+      } catch (e) {
+        social_media = {};
+      }
+    }
+
+    res.json({
+      success: true,
+      profile: {
+        ...company,
+        social_media
+      }
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching company profile:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching company profile'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: UPDATE company profile - FIXED VERSION
+// ============================================
+
+const companyStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const dir = './uploads/companies';
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    cb(null, dir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, `company-${req.user.id}-${uniqueSuffix}${ext}`);
+  }
+});
+
+const companyUpload = multer({ 
+  storage: companyStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    cb(null, mimetype && extname);
+  }
+});
+
+app.put('/api/company/profile', 
+  protect, 
+  companyUpload.fields([
+    { name: 'logo', maxCount: 1 },
+    { name: 'cover_image', maxCount: 1 }
+  ]), 
+  async (req, res) => {
+    let connection;
+    
+    try {
+      connection = await db.getConnection();
+      await connection.beginTransaction();
+
+      console.log('✅ Company profile update started');
+      console.log('👤 User ID:', req.user.id);
+      console.log('📦 Body:', req.body);
+      console.log('🖼️ Files:', req.files ? Object.keys(req.files) : 'No files');
+
+      // Verify user is company
+      if (req.user.user_type !== 'company') {
+        await connection.rollback();
+        connection.release();
+        return res.status(403).json({ 
+          success: false, 
+          message: 'Access denied. Company only.' 
+        });
+      }
+
+      const userId = req.user.id;
+      const {
+        company_name,
+        company_email,
+        phone,
+        website,
+        trade_register,
+        activity_sector,
+        company_size,
+        wilaya,
+        address,
+        contact_person,
+        position,
+        personal_email,
+        description,
+        founded_year,
+        tax_id,
+        social_media
+      } = req.body;
+
+      // ✅ التأكد من وجود الشركة في قاعدة البيانات
+      const [checkCompany] = await connection.execute(
+        'SELECT id FROM companies WHERE user_id = ?',
+        [userId]
+      );
+
+      if (checkCompany.length === 0) {
+        console.log('⚠️ Company not found, creating new record...');
+        
+        // التحقق من وجود البيانات الأساسية
+        const newCompanyName = company_name || 'New Company';
+        const newCompanyEmail = company_email || `company${userId}@temp.com`;
+        
+        await connection.execute(
+          `INSERT INTO companies 
+           (user_id, company_name, company_email, created_at) 
+           VALUES (?, ?, ?, NOW())`,
+          [userId, newCompanyName, newCompanyEmail]
+        );
+        
+        console.log('✅ New company created for user ID:', userId);
+      }
+
+      // Get current profile to check old files
+      const [currentProfile] = await connection.execute(
+        'SELECT logo_url, cover_image_url FROM companies WHERE user_id = ?',
+        [userId]
+      );
+
+      // Handle file uploads
+      let logo_url = currentProfile[0]?.logo_url;
+      let cover_image_url = currentProfile[0]?.cover_image_url;
+
+      if (req.files) {
+        // Upload new logo
+        if (req.files.logo) {
+          if (logo_url) {
+            const oldLogoPath = path.join(__dirname, logo_url);
+            if (fs.existsSync(oldLogoPath)) {
+              fs.unlinkSync(oldLogoPath);
+              console.log('✅ Old logo deleted');
+            }
+          }
+          logo_url = `/uploads/companies/${req.files.logo[0].filename}`;
+          console.log('✅ New logo uploaded:', logo_url);
+        }
+
+        // Upload new cover image
+        if (req.files.cover_image) {
+          if (cover_image_url) {
+            const oldCoverPath = path.join(__dirname, cover_image_url);
+            if (fs.existsSync(oldCoverPath)) {
+              fs.unlinkSync(oldCoverPath);
+              console.log('✅ Old cover deleted');
+            }
+          }
+          cover_image_url = `/uploads/companies/${req.files.cover_image[0].filename}`;
+          console.log('✅ New cover uploaded:', cover_image_url);
+        }
+      }
+
+      // Parse social_media
+      let social_media_json = null;
+      if (social_media) {
+        try {
+          social_media_json = typeof social_media === 'string' 
+            ? social_media 
+            : JSON.stringify(social_media);
+        } catch (e) {
+          social_media_json = JSON.stringify({});
+        }
+      }
+
+      // Build update query
+      const updateFields = [];
+      const updateValues = [];
+
+      if (company_name !== undefined && company_name !== '') {
+        updateFields.push('company_name = ?');
+        updateValues.push(company_name);
+      }
+      if (company_email !== undefined && company_email !== '') {
+        updateFields.push('company_email = ?');
+        updateValues.push(company_email);
+      }
+      if (phone !== undefined) {
+        updateFields.push('phone = ?');
+        updateValues.push(phone || null);
+      }
+      if (website !== undefined) {
+        updateFields.push('website = ?');
+        updateValues.push(website || null);
+      }
+      if (trade_register !== undefined && trade_register !== '') {
+        updateFields.push('trade_register = ?');
+        updateValues.push(trade_register);
+      }
+      if (activity_sector !== undefined) {
+        updateFields.push('activity_sector = ?');
+        updateValues.push(activity_sector || null);
+      }
+      if (company_size !== undefined) {
+        updateFields.push('company_size = ?');
+        updateValues.push(company_size || null);
+      }
+      if (wilaya !== undefined && wilaya !== '') {
+        updateFields.push('wilaya = ?');
+        updateValues.push(wilaya);
+      }
+      if (address !== undefined) {
+        updateFields.push('address = ?');
+        updateValues.push(address || null);
+      }
+      if (contact_person !== undefined && contact_person !== '') {
+        updateFields.push('contact_person = ?');
+        updateValues.push(contact_person);
+      }
+      if (position !== undefined) {
+        updateFields.push('position = ?');
+        updateValues.push(position || null);
+      }
+      if (personal_email !== undefined) {
+        updateFields.push('personal_email = ?');
+        updateValues.push(personal_email || null);
+      }
+      if (description !== undefined) {
+        updateFields.push('description = ?');
+        updateValues.push(description || null);
+      }
+      if (founded_year !== undefined) {
+        updateFields.push('founded_year = ?');
+        updateValues.push(founded_year || null);
+      }
+      if (tax_id !== undefined) {
+        updateFields.push('tax_id = ?');
+        updateValues.push(tax_id || null);
+      }
+      if (logo_url) {
+        updateFields.push('logo_url = ?');
+        updateValues.push(logo_url);
+      }
+      if (cover_image_url) {
+        updateFields.push('cover_image_url = ?');
+        updateValues.push(cover_image_url);
+      }
+      if (social_media_json) {
+        updateFields.push('social_media = ?');
+        updateValues.push(social_media_json);
+      }
+
+      // Always update profile_completed and updated_at
+      updateFields.push('profile_completed = 1');
+      updateFields.push('updated_at = NOW()');
+
+      if (updateFields.length > 0) {
+        updateValues.push(userId);
+        
+        const sql = `UPDATE companies SET ${updateFields.join(', ')} WHERE user_id = ?`;
+        console.log('📝 SQL Query:', sql);
+        console.log('📝 Values:', updateValues);
+        
+        const [result] = await connection.execute(sql, updateValues);
+        console.log('✅ Update result:', result);
+      }
+
+      // Update email in users table if changed
+      if (company_email && company_email !== '') {
+        await connection.execute(
+          'UPDATE users SET email = ? WHERE id = ?',
+          [company_email, userId]
+        );
+        console.log('✅ User email updated');
+      }
+
+      await connection.commit();
+      console.log('✅ Transaction committed');
+
+      // Get updated profile
+      const [updatedProfile] = await db.execute(
+        'SELECT * FROM companies WHERE user_id = ?',
+        [userId]
+      );
+
+      res.json({
+        success: true,
+        message: 'Company profile updated successfully',
+        profile: updatedProfile[0] || null
+      });
+
+    } catch (error) {
+      if (connection) {
+        await connection.rollback();
+        connection.release();
+      }
+      
+      console.error('🔥 Error updating company profile:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: 'Error updating company profile: ' + error.message
+      });
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+});
+
+
+
+// ============================================
+// 📌 ROUTE: GET company dashboard stats
+// ============================================
+
+app.get('/api/company/dashboard-stats', protect, async (req, res) => {
+  try {
+    // Verify user is company
+    if (req.user.user_type !== 'company') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+
+    // التحقق من وجود جدول internships
+    const [tables] = await db.execute(
+      "SHOW TABLES LIKE 'internships'"
+    );
+
+    if (tables.length === 0) {
+      // جدول غير موجود -> أرجع إحصائيات فارغة
+      return res.json({
+        success: true,
+        stats: {
+          totalInternships: 0,
+          totalApplications: 0,
+          pendingApplications: 0,
+          interviewApplications: 0,
+          acceptedApplications: 0
+        }
+      });
+    }
+
+    // Get total internships - مع معالجة الأخطاء
+    let totalInternships = 0;
+    try {
+      const [internships] = await db.execute(
+        'SELECT COUNT(*) as count FROM internships WHERE company_id = ?',
+        [userId]
+      );
+      totalInternships = internships[0]?.count || 0;
+    } catch (err) {
+      console.log('⚠️ Error counting internships:', err.message);
+    }
+
+    // التحقق من وجود جدول student_internships
+    const [appsTable] = await db.execute(
+      "SHOW TABLES LIKE 'student_internships'"
+    );
+
+    if (appsTable.length === 0) {
+      return res.json({
+        success: true,
+        stats: {
+          totalInternships,
+          totalApplications: 0,
+          pendingApplications: 0,
+          interviewApplications: 0,
+          acceptedApplications: 0
+        }
+      });
+    }
+
+    // Get application stats - مع معالجة الأخطاء
+    let totalApplications = 0;
+    let pendingApplications = 0;
+    let interviewApplications = 0;
+    let acceptedApplications = 0;
+
+    try {
+      const [applications] = await db.execute(
+        `SELECT 
+          COUNT(*) as total,
+          SUM(CASE WHEN si.status = 'pending' THEN 1 ELSE 0 END) as pending,
+          SUM(CASE WHEN si.status = 'interview' THEN 1 ELSE 0 END) as interview,
+          SUM(CASE WHEN si.status = 'accepted' THEN 1 ELSE 0 END) as accepted
+        FROM student_internships si
+        JOIN internships i ON si.internship_id = i.id
+        WHERE i.company_id = ?`,
+        [userId]
+      );
+
+      if (applications.length > 0) {
+        totalApplications = applications[0].total || 0;
+        pendingApplications = applications[0].pending || 0;
+        interviewApplications = applications[0].interview || 0;
+        acceptedApplications = applications[0].accepted || 0;
+      }
+    } catch (err) {
+      console.log('⚠️ Error counting applications:', err.message);
+    }
+
+    res.json({
+      success: true,
+      stats: {
+        totalInternships,
+        totalApplications,
+        pendingApplications,
+        interviewApplications,
+        acceptedApplications
+      }
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching dashboard stats:', error);
+    // ✅ أرجع إحصائيات فارغة بدلاً من خطأ
+    res.json({
+      success: true,
+      stats: {
+        totalInternships: 0,
+        totalApplications: 0,
+        pendingApplications: 0,
+        interviewApplications: 0,
+        acceptedApplications: 0
+      }
+    });
+  }
+});
+
+
+// ============================================
+// 📌 ROUTE: GET single internship for editing
+// ============================================
+app.get('/api/company/internships/:id', protect, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'company') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+    const internshipId = req.params.id;
+
+    const [internships] = await db.execute(
+      `SELECT * FROM internships 
+       WHERE id = ? AND company_id = ?`,
+      [internshipId, userId]
+    );
+
+    if (internships.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Internship not found'
+      });
+    }
+
+    const internship = internships[0];
+    
+    // Parse required_skills
+    if (internship.required_skills) {
+      try {
+        internship.required_skills = JSON.parse(internship.required_skills);
+      } catch (e) {
+        internship.required_skills = [];
+      }
+    }
+
+    res.json({
+      success: true,
+      internship
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching internship:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error fetching internship'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: UPDATE internship
+// ============================================
+app.put('/api/company/internships/:id', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+
+    if (req.user.user_type !== 'company') {
+      await connection.rollback();
+      connection.release();
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+    const internshipId = req.params.id;
+    const {
+      title,
+      description,
+      location,
+      type,
+      duration,
+      stipend,
+      stipend_type,
+      required_skills,
+      requirements,
+      benefits,
+      deadline,
+      positions_available,
+      status
+    } = req.body;
+
+    // Verify ownership
+    const [check] = await connection.execute(
+      'SELECT id FROM internships WHERE id = ? AND company_id = ?',
+      [internshipId, userId]
+    );
+
+    if (check.length === 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({
+        success: false,
+        message: 'Internship not found or unauthorized'
+      });
+    }
+
+    // Build update query
+    const updateFields = [];
+    const updateValues = [];
+
+    if (title) {
+      updateFields.push('title = ?');
+      updateValues.push(title);
+    }
+    if (description) {
+      updateFields.push('description = ?');
+      updateValues.push(description);
+    }
+    if (location) {
+      updateFields.push('location = ?');
+      updateValues.push(location);
+    }
+    if (type) {
+      updateFields.push('type = ?');
+      updateValues.push(type);
+    }
+    if (duration !== undefined) {
+      updateFields.push('duration = ?');
+      updateValues.push(duration || null);
+    }
+    if (stipend !== undefined) {
+      updateFields.push('stipend = ?');
+      updateValues.push(stipend || 0);
+    }
+    if (stipend_type) {
+      updateFields.push('stipend_type = ?');
+      updateValues.push(stipend_type);
+    }
+    if (required_skills) {
+      updateFields.push('required_skills = ?');
+      updateValues.push(JSON.stringify(required_skills));
+    }
+    if (requirements !== undefined) {
+      updateFields.push('requirements = ?');
+      updateValues.push(requirements || null);
+    }
+    if (benefits !== undefined) {
+      updateFields.push('benefits = ?');
+      updateValues.push(benefits || null);
+    }
+    if (deadline !== undefined) {
+      updateFields.push('deadline = ?');
+      updateValues.push(deadline || null);
+    }
+    if (positions_available) {
+      updateFields.push('positions_available = ?');
+      updateValues.push(positions_available);
+    }
+    if (status) {
+      updateFields.push('status = ?');
+      updateValues.push(status);
+    }
+
+    updateFields.push('updated_at = NOW()');
+    updateValues.push(internshipId);
+
+    if (updateFields.length > 0) {
+      await connection.execute(
+        `UPDATE internships SET ${updateFields.join(', ')} WHERE id = ?`,
+        updateValues
+      );
+    }
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: 'Internship updated successfully'
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    
+    console.error('🔥 Error updating internship:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error updating internship'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: DELETE internship - FIXED (بدون saved_internships)
+// ============================================
+app.delete('/api/company/internships/:id', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+
+    console.log('🗑️ Attempting to delete internship:', req.params.id);
+    
+    // Verify user is company
+    if (req.user.user_type !== 'company') {
+      await connection.rollback();
+      connection.release();
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+    const internshipId = req.params.id;
+
+    // 1️⃣ Verify ownership
+    const [check] = await connection.execute(
+      'SELECT id, title FROM internships WHERE id = ? AND company_id = ?',
+      [internshipId, userId]
+    );
+
+    if (check.length === 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({
+        success: false,
+        message: 'Internship not found or unauthorized'
+      });
+    }
+
+    console.log('✅ Found internship:', check[0].title);
+
+    // 2️⃣ Check for related applications in student_internships
+    const [applications] = await connection.execute(
+      'SELECT COUNT(*) as count FROM student_internships WHERE internship_id = ?',
+      [internshipId]
+    );
+    
+    console.log(`📊 Found ${applications[0].count} related applications`);
+
+    // 3️⃣ Delete related applications first (if any)
+    if (applications[0].count > 0) {
+      await connection.execute(
+        'DELETE FROM student_internships WHERE internship_id = ?',
+        [internshipId]
+      );
+      console.log('✅ Deleted related applications');
+    }
+
+    // 4️⃣ Finally delete the internship
+    const [result] = await connection.execute(
+      'DELETE FROM internships WHERE id = ?',
+      [internshipId]
+    );
+    
+    console.log('✅ Internship deleted, affected rows:', result.affectedRows);
+
+    await connection.commit();
+    console.log('✅ Transaction committed successfully');
+    
+    res.json({
+      success: true,
+      message: 'Internship deleted successfully'
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('🔥 Error deleting internship:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error deleting internship: ' + error.message
+    });
+  } finally {
+    connection.release();
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Update internship status (close, active, filled)
+// ============================================
+app.put('/api/company/internships/:id/status', protect, async (req, res) => {
+  try {
+    if (req.user.user_type !== 'company') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Company only.' 
+      });
+    }
+
+    const userId = req.user.id;
+    const internshipId = req.params.id;
+    const { status } = req.body;
+
+    // Validate status
+    const validStatuses = ['active', 'inactive', 'filled', 'closed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status'
+      });
+    }
+
+    const [result] = await db.execute(
+      'UPDATE internships SET status = ? WHERE id = ? AND company_id = ?',
+      [status, internshipId, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Internship not found or unauthorized'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Internship status updated to ${status}`
+    });
+
+  } catch (error) {
+    console.error('🔥 Error updating status:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error updating status'
+    });
+  }
+});
+
+
+// ============================================
+// 📌 ROUTE: Get student notifications (محدث)
+// ============================================
+app.get('/api/student/notifications', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // التحقق من أن المستخدم طالب
+    if (req.user.user_type !== 'student') {
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Access denied. Students only.' 
+      });
+    }
+
+    // جلب إشعارات الطالب من قاعدة البيانات
+    const [notifications] = await db.execute(
+      `SELECT * FROM notifications 
+       WHERE user_id = ? 
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    console.log(`📨 Found ${notifications.length} notifications for student ${userId}`);
+
+    res.json({
+      success: true,
+      notifications: notifications
+    });
+
+  } catch (error) {
+    console.error('🔥 Error fetching student notifications:', error);
+    res.json({ 
+      success: true, 
+      notifications: [] 
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Mark notification as read
+// ============================================
+app.put('/api/student/notifications/:id/read', protect, async (req, res) => {
+  try {
+    const notificationId = req.params.id;
+    const userId = req.user.id;
+
+    const [result] = await db.execute(
+      'UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?',
+      [notificationId, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Notification marked as read'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error marking notification:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notification'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Mark all notifications as read
+// ============================================
+app.put('/api/student/notifications/read-all', protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    await db.execute(
+      'UPDATE notifications SET is_read = 1 WHERE user_id = ?',
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'All notifications marked as read'
+    });
+
+  } catch (error) {
+    console.error('🔥 Error marking all notifications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating notifications'
+    });
+  }
+});
+
+
+
+// ============================================
+// 📌 ROUTE: Sign agreement (للطالب)
+// ============================================
+app.put('/api/student/agreements/:agreementId/sign', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+    
+    const studentId = req.user.id;
+    const agreementId = req.params.agreementId;
+    
+    console.log(`✍️ Student ${studentId} signing agreement ${agreementId}`);
+    
+    // التحقق من أن الاتفاقية موجودة وتخص هذا الطالب
+    const [agreements] = await connection.execute(
+      `SELECT a.*, i.company_id, i.title as internship_title 
+       FROM agreements a
+       JOIN internships i ON a.internship_id = i.id
+       WHERE a.id = ? AND a.student_id = ?`,
+      [agreementId, studentId]
+    );
+    
+    if (agreements.length === 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Agreement not found' 
+      });
+    }
+    
+    const agreement = agreements[0];
+    
+    // التحقق من أن الاتفاقية لم توقع بعد
+    if (agreement.student_signed) {
+      await connection.rollback();
+      connection.release();
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Agreement already signed' 
+      });
+    }
+    
+    // تحديث حالة التوقيع
+    await connection.execute(
+      `UPDATE agreements 
+       SET student_signed = 1, 
+           status = 'signed',
+           signed_at = NOW() 
+       WHERE id = ?`,
+      [agreementId]
+    );
+    
+    // إنشاء إشعار للطالب
+    await connection.execute(
+      `INSERT INTO notifications 
+       (user_id, type, title, message, application_id, created_at) 
+       VALUES (?, 'agreement_signed', ?, ?, ?, NOW())`,
+      [
+        studentId,
+        '✅ Agreement Signed',
+        `You have successfully signed the agreement for "${agreement.internship_title}".`,
+        agreement.application_id || null
+      ]
+    );
+    
+    // إنشاء إشعار للشركة
+    await connection.execute(
+      `INSERT INTO company_notifications 
+       (company_id, type, title, message, application_id, created_at) 
+       VALUES (?, 'agreement_signed', ?, ?, ?, NOW())`,
+      [
+        agreement.company_id,
+        '📄 Agreement Signed by Student',
+        `${agreement.student_name || 'Student'} has signed the agreement for "${agreement.internship_title}".`,
+        agreement.application_id || null
+      ]
+    );
+    
+    // إنشاء إشعار للإدارة
+    await connection.execute(
+      `INSERT INTO admin_notifications 
+       (type, title, message, application_id, created_at) 
+       VALUES ('agreement_signed', ?, ?, ?, NOW())`,
+      [
+        '📄 Agreement Signed',
+        `${agreement.student_name || 'Student'} has signed the agreement with ${agreement.company_name || 'Company'}.`,
+        agreement.application_id || null
+      ]
+    );
+    
+    await connection.commit();
+    connection.release();
+    
+    res.json({ 
+      success: true, 
+      message: 'Agreement signed successfully' 
+    });
+    
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    
+    console.error('🔥 Error signing agreement:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error signing agreement',
+      error: error.message 
+    });
+  }
+});
+
+
+// ============================================
+// 📌 ROUTE: Get company notifications
+// ============================================
+app.get('/api/company/notifications', protect, async (req, res) => {
+  try {
+    const companyId = req.user.id;
+    
+    const [notifications] = await db.execute(
+      `SELECT * FROM company_notifications 
+       WHERE company_id = ? 
+       ORDER BY created_at DESC`,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      notifications
+    });
+  } catch (error) {
+    console.error('Error fetching company notifications:', error);
+    res.json({ success: true, notifications: [] });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Mark company notification as read
+// ============================================
+app.put('/api/company/notifications/:id/read', protect, async (req, res) => {
+  try {
+    const notificationId = req.params.id;
+    const companyId = req.user.id;
+
+    await db.execute(
+      'UPDATE company_notifications SET is_read = 1 WHERE id = ? AND company_id = ?',
+      [notificationId, companyId]
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error marking notification:', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Get company notifications
+// ============================================
+app.get('/api/company/notifications', protect, async (req, res) => {
+  try {
+    const companyId = req.user.id;
+    
+    const [notifications] = await db.execute(
+      `SELECT * FROM company_notifications 
+       WHERE company_id = ? 
+       ORDER BY created_at DESC`,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      notifications
+    });
+  } catch (error) {
+    console.error('Error fetching company notifications:', error);
+    res.json({ success: true, notifications: [] });
+  }
+});
+
+
+
+// ============================================
+// 📌 ROUTE: Rate company
+// ============================================
+app.post('/api/student/rate-company', protect, async (req, res) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+    
+    const studentId = req.user.id;
+    const {
+      company_id,
+      internship_id,
+      agreement_id,
+      rating,
+      review,
+      would_recommend,
+      communication_rating,
+      supervision_rating,
+      learning_rating,
+      work_environment_rating
+    } = req.body;
+
+    // التحقق من أن الطالب أكمل التدريب
+    const [agreements] = await connection.execute(
+      'SELECT id FROM agreements WHERE id = ? AND student_id = ? AND status = "completed"',
+      [agreement_id, studentId]
+    );
+
+    if (agreements.length === 0) {
+      await connection.rollback();
+      connection.release();
+      return res.status(403).json({
+        success: false,
+        message: 'You can only rate companies after completing the internship'
+      });
+    }
+
+    // إضافة التقييم
+    await connection.execute(
+      `INSERT INTO company_ratings 
+       (student_id, company_id, internship_id, agreement_id, rating, review, 
+        would_recommend, communication_rating, supervision_rating, 
+        learning_rating, work_environment_rating)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        studentId, company_id, internship_id, agreement_id, rating, review,
+        would_recommend, communication_rating, supervision_rating,
+        learning_rating, work_environment_rating
+      ]
+    );
+
+    // حساب متوسط التقييم للشركة
+    const [avgRating] = await connection.execute(
+      `SELECT AVG(rating) as average_rating 
+       FROM company_ratings 
+       WHERE company_id = ?`,
+      [company_id]
+    );
+
+    // تحديث متوسط التقييم في جدول الشركات
+    await connection.execute(
+      'UPDATE companies SET average_rating = ? WHERE user_id = ?',
+      [avgRating[0].average_rating, company_id]
+    );
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: 'Rating submitted successfully'
+    });
+
+  } catch (error) {
+    await connection.rollback();
+    connection.release();
+    
+    console.error('Error submitting rating:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error submitting rating'
+    });
+  }
+});
+
+// ============================================
+// 📌 ROUTE: Get company profile for rating
+// ============================================
+app.get('/api/company/profile/:companyId', protect, async (req, res) => {
+  try {
+    const companyId = req.params.companyId;
+    
+    const [companies] = await db.execute(
+      'SELECT company_name FROM companies WHERE user_id = ?',
+      [companyId]
+    );
+
+    if (companies.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Company not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      profile: companies[0]
+    });
+
+  } catch (error) {
+    console.error('Error fetching company:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching company'
+    });
+  }
+});
+
+
+
+// Start server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, async () => {
+    console.log('\n' + '='.repeat(70));
+    console.log('🚀 STAG Platform Backend v3.0 - WITH COMPANY INTERNSHIPS!');
+    console.log('='.repeat(70));
+    console.log(`📡 Server: http://localhost:${PORT}`);
+    console.log(`🔧 Port: ${PORT}`);
+    console.log(`🗄️  Database: ${process.env.DB_NAME || 'stag_io_platform'}`);
+    
+    // Test database connection
+    try {
+        const [result] = await db.execute('SELECT 1 + 1 AS result');
+        console.log(`✅ Database: Connected ✓`);
+        
+        // Check and update table structure automatically
+        await db.checkAndUpdateTables();
+        
+    } catch (error) {
+        console.log(`❌ Database: Not connected ✗ (${error.message})`);
+    }
+    
+    console.log('\n' + '🏢 COMPANY ENDPOINTS '.padEnd(50, '-'));
+    console.log('│ POST   /api/company/internships         - Create internship (PROTECTED)');
+    console.log('│ GET    /api/company/internships         - Get company internships (PROTECTED)');
+    
+    console.log('\n' + '🎓 STUDENT ENDPOINTS '.padEnd(50, '-'));
+    console.log('│ GET    /api/internships                 - Browse internships (PROTECTED)');
+    console.log('│ POST   /api/student/applications        - Apply to internship (PROTECTED)');
+    
+    console.log('\n' + '👤 PROFILE ENDPOINTS '.padEnd(50, '-'));
+    console.log('│ GET    /api/auth/me                    - Get user profile (PROTECTED)');
+    console.log('│ PUT    /api/student/profile            - Update student profile (PROTECTED)');
+    console.log('│ DELETE /api/student/cv                 - Delete CV (PROTECTED)');
+    
+
+console.log('\n' + '📋 APPLICATION ENDPOINTS '.padEnd(50, '-'));
+console.log('│ GET    /api/student/applications           - Get student applications (PROTECTED)');
+console.log('│ DELETE /api/student/applications/:id       - Withdraw application (PROTECTED)');
+console.log('│ GET    /api/company/applications           - Get company applications (PROTECTED)');
+console.log('│ PUT    /api/company/applications/:id/status - Update status (PROTECTED)');
+
+// In the server startup section, add:
+console.log('\n' + '🔍 INTERNSHIP DETAILS '.padEnd(50, '-'));
+console.log('│ GET    /api/internships/:id             - Get internship details (PROTECTED)');
+    console.log('\n' + '='.repeat(70));
+    console.log('✅ Ready! All endpoints are now active.\n');
+
+    // في قسم console.log أضف:
+console.log('\n' + '💾 SAVED INTERNSHIPS '.padEnd(50, '-'));
+console.log('│ GET    /api/student/saved-internships              - Get all saved (PROTECTED)');
+console.log('│ POST   /api/student/saved-internships/:id          - Save internship (PROTECTED)');
+console.log('│ DELETE /api/student/saved-internships/:id          - Remove saved (PROTECTED)');
+console.log('│ DELETE /api/student/saved-internships              - Remove all (PROTECTED)');
+console.log('│ GET    /api/student/saved-internships/check/:id    - Check if saved (PROTECTED)');
+console.log('│ PUT    /api/student/saved-internships/:id/notes    - Add notes (PROTECTED)');
+console.log('│ GET    /api/student/saved-internships/recommendations - Get recommendations (PROTECTED)');
+
+});
