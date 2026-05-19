@@ -15,8 +15,9 @@ const pool = mysql.createPool({
     //port: process.env.DB_PORT,
     waitForConnections: true,
     //connectionLimit: 10,
-    connectionLimit: 3,
-    queueLimit: 0,
+    connectionLimit: 4,
+    //queueLimit: 0,
+    queueLimit: 10,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0
 });
@@ -24,7 +25,8 @@ const pool = mysql.createPool({
 const db = pool.promise();
 
 db.checkAndUpdateTables = async () => {
-    const connection = await pool.promise().getConnection();
+    //const connection = await pool.promise().getConnection();
+    const connection = await db.getConnection();
     
     try {
         console.log('🔍 Checking database table structure...');
