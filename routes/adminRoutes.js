@@ -3,6 +3,8 @@ const router = express.Router();
 const db = require('../config/database');
 const { protect } = require('../middleware/authMiddleware');
 
+const BASE = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
 const { generateConventionDeStagePDF } = require('../server');
 
 const isAdmin = async (req, res, next) => {
@@ -33,7 +35,8 @@ const sendAgreementEmail = async (agreementData) => {
       }
     });
 
-    const pdfLink = `http://stag-io-backend.onrender.com${pdf_url}`;
+    //const pdfLink = `http://localhost:5000${pdf_url}`;
+    const pdfLink = `${BASE}${pdf_url}`;
 
     const mailOptions = {
       from: `"STAG Platform" <${process.env.EMAIL_USER}>`,
@@ -1159,7 +1162,8 @@ router.post('/api/admin/agreements/:id/send', protect, isAdmin, async (req, res)
       }
     });
 
-    const pdfLink = `http://stag-io-backend.onrender.com${agreement.pdf_url}`;
+    //const pdfLink = `http://localhost:5000${agreement.pdf_url}`;
+    const pdfLink = `${BASE}${agreement.pdf_url}`;
 
     const mailOptions = {
       from: `"STAG Platform" <${process.env.EMAIL_USER || 'your-email@gmail.com'}>`,

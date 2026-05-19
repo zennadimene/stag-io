@@ -25,6 +25,8 @@ const notificationService = require('./services/notificationService');
 const db = require('./config/database');
 const { protect } = require('./middleware/authMiddleware');
 
+const BASE = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
 // Import auth controllers
 const { 
     registerStudent, 
@@ -43,40 +45,10 @@ const authenticate = protect;
 const AUTO_VERIFY = true; 
 
 // MIDDLEWARE
-//app.use(cors());
-//app.use(express.json());
-
-
-
-const allowedOrigins = [
-    'https://stag-io-frontend-ev3w.vercel.app',
-    'https://stag-io-frontend-ev3w.vercel.app',
-    'http://localhost:3000',
-    'http://stag-io-backend.onrender.com'
-];
-
-app.use(cors({
-    origin: function(origin, callback) {
-        // Allow requests with no origin (like mobile apps, curl, postman)
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            console.log('❌ CORS blocked origin:', origin);
-            callback(null, false);
-            // Still allow but log (don't throw error for development)
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
-}));
-
-// Handle preflight requests
-app.options('*', cors());
-
+app.use(cors());
 app.use(express.json());
+
+
 
 // Static files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -8578,7 +8550,7 @@ app.post('/api/admin/agreements/:id/send', protect, async (req, res) => {
     const agreement = agreements[0];
     
     // إنشاء رابط PDF
-    const pdfLink = `http://stag-io-backend.onrender.com${agreement.pdf_url}`;
+    const pdfLink = `${BASE}${agreement.pdf_url}`;
     
     // إرسال البريد (اختياري - يمكنك تفعيله لاحقاً)
     console.log('📨 Email would be sent to:', {

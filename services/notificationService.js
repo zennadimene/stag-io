@@ -2,6 +2,7 @@
 const db = require('../config/database');  
 const { sendEmail, emailTemplates } = require('../config/email');  
 
+const BASE = process.env.REACT_APP_API_URL || 'http://localhost:5000';
 
 let io = null;
 const activeUsers = new Map();
@@ -390,7 +391,7 @@ const notifyInternshipCompleted = async (completionData) => {
                     <h3>${internshipTitle}</h3>
                     ${certificateUrl ? `
                         <p>Your certificate is now available:</p>
-                        <a href="http://stag-io-backend.onrender.com${certificateUrl}" 
+                        <a href="${BASE}${certificateUrl}" 
                            style="background: #6b46c1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
                             📜 Download Certificate
                         </a>
